@@ -149,10 +149,10 @@ class TweetUrlModal extends Modal {
 			type: "text",
 			placeholder: "Paste tweet URL here...",
 		});
-		inputEl.addClass("x-post-saver-input");
+		inputEl.addClass("x-post-embed-input");
 
 		const controlsRow = contentEl.createDiv({
-			cls: "x-post-saver-controls-row",
+			cls: "x-post-embed-controls-row",
 		});
 
 		const pasteBtn = controlsRow.createEl("button", {
@@ -179,11 +179,11 @@ class TweetUrlModal extends Modal {
 						this.openAfterSave = value;
 					})
 			);
-		openToggle.settingEl.addClass("x-post-saver-inline-toggle");
+		openToggle.settingEl.addClass("x-post-embed-inline-toggle");
 
 		const submitBtn = contentEl.createEl("button", { text: "Save" });
 		submitBtn.addClass("mod-cta");
-		submitBtn.addClass("x-post-saver-submit");
+		submitBtn.addClass("x-post-embed-submit");
 		submitBtn.addEventListener("click", () => {
 			this.onSubmit(inputEl.value, this.openAfterSave);
 			this.close();

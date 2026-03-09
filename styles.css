@@ -1,4 +1,4 @@
-.x-post-saver-controls-row {
+.x-post-embed-controls-row {
 	display: flex;
 	gap: var(--spacing-xs, 0.5rem);
 	align-items: center;
@@ -6,21 +6,21 @@
 	padding: var(--spacing-xs, 0.5rem);
 }
 
-.x-post-saver-input {
+.x-post-embed-input {
 	width: 100%;
 }
 
-.x-post-saver-inline-toggle {
+.x-post-embed-inline-toggle {
 	border: none;
 	padding: 0;
 }
 
-.x-post-saver-submit {
+.x-post-embed-submit {
 	margin-top: var(--spacing-m, 1rem);
 	width: 100%;
 }
 
-.x-post-saver-controls-row .mod-cta,
-.x-post-saver-controls-row .mod-cta + .mod-cta {
+.x-post-embed-controls-row .mod-cta,
+.x-post-embed-controls-row .mod-cta + .mod-cta {
 	margin-left: var(--spacing-xs, 0.5rem);
 }
