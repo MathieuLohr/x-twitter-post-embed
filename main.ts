@@ -171,7 +171,8 @@ class TweetUrlModal extends Modal {
 					const text = await navigator.clipboard.readText();
 					inputEl.value = text;
 				} catch {
-					new Notice("Failed to read clipboard");
+					new Notice("Clipboard access blocked by OS. Please long-press to paste.");
+					inputEl.focus();
 				}
 			})();
 		});
@@ -404,9 +405,9 @@ export default class XPostEmbedPlugin extends Plugin {
 			let thread_texts: string[];
 			if (tweet.replying_to?.post && tweet.replying_to?.screen_name?.toLowerCase() === (author.screen_name ?? "").toLowerCase()) {
 				const threadTweets = await this.reconstructThread(tweet);
-				thread_texts = threadTweets.map((t: FxTweet) => this.extractTextWithQuotes(t));
+				thread_texts = threadTweets.map((t: FxTweet) => this.compileTweetNode(t));
 			} else {
-				thread_texts = [this.extractTextWithQuotes(tweet)];
+				thread_texts = [this.compileTweetNode(tweet)];
 			}
 
 			return {
@@ -419,8 +420,8 @@ export default class XPostEmbedPlugin extends Plugin {
 				tweet_text: tweet.text || "",
 				thread_texts,
 				tweet_date: date,
-				media_urls: tweet.media?.all?.map((m: { url: string }) => m.url) || [],
-				community_note: tweet.community_note || null,
+				media_urls: [], // Already inlined per-tweet by compileTweetNode
+				community_note: null, // Already inlined per-tweet by compileTweetNode
 				metrics: {
 					likes: tweet.likes || 0,
 					reposts: tweet.reposts || 0,
@@ -441,13 +442,13 @@ export default class XPostEmbedPlugin extends Plugin {
 
 		let thread_texts: string[] = [];
 		if (json.thread && Array.isArray(json.thread) && json.thread.length > 0) {
-			thread_texts = json.thread.map((t: FxTweet) => this.extractTextWithQuotes(t));
+			thread_texts = json.thread.map((t: FxTweet) => this.compileTweetNode(t));
 		} else if (focalTweet.replying_to?.post && focalTweet.replying_to?.screen_name?.toLowerCase() === (focalTweet.author?.screen_name ?? author.screen_name ?? "").toLowerCase()) {
 			// Thread endpoint returned null/empty — reconstruct by walking reply chain
 			const threadTweets = await this.reconstructThread(focalTweet);
-			thread_texts = threadTweets.map((t: FxTweet) => this.extractTextWithQuotes(t));
+			thread_texts = threadTweets.map((t: FxTweet) => this.compileTweetNode(t));
 		} else {
-			thread_texts = [this.extractTextWithQuotes(focalTweet)];
+			thread_texts = [this.compileTweetNode(focalTweet)];
 		}
 
 		const date = this.formatDateFromFx(focalTweet.created_at ?? "");
@@ -462,8 +463,8 @@ export default class XPostEmbedPlugin extends Plugin {
 			tweet_text: focalTweet.text || "",
 			thread_texts,
 			tweet_date: date,
-			media_urls: focalTweet.media?.all?.map((m: { url: string }) => m.url) || [],
-			community_note: focalTweet.community_note || null,
+			media_urls: [], // Already inlined per-tweet by compileTweetNode
+			community_note: null, // Already inlined per-tweet by compileTweetNode
 			metrics: {
 				likes: focalTweet.likes || 0,
 				reposts: focalTweet.reposts || 0,
@@ -557,22 +558,30 @@ export default class XPostEmbedPlugin extends Plugin {
 		return tweets;
 	}
 
-	private extractTextWithQuotes(tweet: FxTweet): string {
-		let text = tweet.text || "";
+	private compileTweetNode(tweet: FxTweet): string {
+		let content = tweet.text || "";
+
+		// Attach media directly below the text it belongs to
+		if (this.settings.includeMedia && tweet.media?.all && tweet.media.all.length > 0) {
+			content += tweet.media.all.map((m: { url: string }) => `\n\n![Embedded Media](${m.url})`).join("");
+		}
+
+		// Format quoted tweet as a nested blockquote
 		if (tweet.quote) {
 			const quoteAuthor =
 				tweet.quote.author?.screen_name ||
 				tweet.quote.author?.name ||
 				"Unknown";
-			const quoteText = this.extractTextWithQuotes(tweet.quote);
-			// Append the quote formatted as a nested quote block
-			text += `\n\n> [!quote] Quoting @${quoteAuthor}\n> ${quoteText.replace(
-				/\n/g,
-				"\n> "
-			)}`;
+			const quoteContent = this.compileTweetNode(tweet.quote);
+			content += `\n\n> [!quote] Quoting @${quoteAuthor}\n> ${quoteContent.replace(/\n/g, "\n> ")}`;
 		}
 
-		return text;
+		// Attach community note to the specific post it belongs to
+		if (this.settings.includeCommunityNote && tweet.community_note) {
+			content += `\n\n> [!warning] Community Note:\n> ${tweet.community_note.replace(/\n/g, "\n> ")}`;
+		}
+
+		return content;
 	}
 
 	// --- oEmbed API (fallback) ---
@@ -607,6 +616,14 @@ export default class XPostEmbedPlugin extends Plugin {
 	}
 
 	// --- Shared utilities ---
+
+	debounce<T extends (...args: unknown[]) => unknown>(func: T, wait: number): (...args: Parameters<T>) => void {
+		let timeout: ReturnType<typeof setTimeout>;
+		return (...args: Parameters<T>) => {
+			clearTimeout(timeout);
+			timeout = setTimeout(() => func(...args), wait);
+		};
+	}
 
 	async fetchWithTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
 		const timeout = new Promise<never>((_, reject) =>
@@ -648,8 +665,8 @@ export default class XPostEmbedPlugin extends Plugin {
 
 			let text = tweetParagraph.textContent || "";
 
-			// Remove trailing t.co links
-			text = text.replace(/\s*https:\/\/t\.co\/\w+\s*$/g, "").trim();
+			// Remove one or more consecutive trailing t.co links
+			text = text.replace(/(?:\s*https:\/\/t\.co\/\w+)+\s*$/g, "").trim();
 
 			return text;
 		} catch {
@@ -661,12 +678,13 @@ export default class XPostEmbedPlugin extends Plugin {
 		try {
 			const parser = new DOMParser();
 			const doc = parser.parseFromString(html, "text/html");
-			const links = doc.querySelectorAll("blockquote.twitter-tweet a");
-			const lastLink = links[links.length - 1];
-			if (lastLink && lastLink.textContent) {
-				return lastLink.textContent.trim();
-			}
-			return null;
+			const links = Array.from(doc.querySelectorAll("blockquote.twitter-tweet a"));
+			// Search from the end for an anchor containing a 4-digit year
+			const dateLink = links.reverse().find(link => {
+				const text = link.textContent?.trim() || "";
+				return text.length > 0 && !text.startsWith("#") && !text.startsWith("@") && /\d{4}/.test(text);
+			});
+			return dateLink ? dateLink.textContent!.trim() : null;
 		} catch {
 			return null;
 		}
@@ -1076,16 +1094,14 @@ class XPostEmbedSettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("Tweets folder")
 			.setDesc("Folder where saved tweets are stored.")
-			.addText((text) =>
-				text
-					.setPlaceholder("Tweets")
-					.setValue(this.plugin.settings.tweetsFolder)
-					.onChange(async (value) => {
-						this.plugin.settings.tweetsFolder =
-							value || "Tweets";
-						await this.plugin.saveSettings();
-					})
-			);
+			.addText((text) => {
+				text.setPlaceholder("Tweets").setValue(this.plugin.settings.tweetsFolder);
+				const debouncedSave = this.plugin.debounce(async (value: string) => {
+					this.plugin.settings.tweetsFolder = value || "Tweets";
+					await this.plugin.saveSettings();
+				}, 500);
+				text.onChange(debouncedSave);
+			});
 
 		new Setting(containerEl)
 			.setName("Enable author pages")
@@ -1102,16 +1118,14 @@ class XPostEmbedSettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("Author pages folder")
 			.setDesc("Folder where per-author aggregation pages are stored.")
-			.addText((text) =>
-				text
-					.setPlaceholder("Tweets/authors")
-					.setValue(this.plugin.settings.authorPagesFolder)
-					.onChange(async (value) => {
-						this.plugin.settings.authorPagesFolder =
-							value || "Tweets/Authors";
-						await this.plugin.saveSettings();
-					})
-			);
+			.addText((text) => {
+				text.setPlaceholder("Tweets/authors").setValue(this.plugin.settings.authorPagesFolder);
+				const debouncedSave = this.plugin.debounce(async (value: string) => {
+					this.plugin.settings.authorPagesFolder = value || "Tweets/Authors";
+					await this.plugin.saveSettings();
+				}, 500);
+				text.onChange(debouncedSave);
+			});
 
 		new Setting(containerEl)
 			.setName("Author page order")
