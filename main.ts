@@ -31,6 +31,7 @@ interface XPostEmbedSettings {
 	includeMetrics: boolean;
 	includeAuthorBio: boolean;
 	metadataAtTop: boolean;
+	separatorPosition: "none" | "above" | "below" | "both";
 }
 
 const DEFAULT_SETTINGS: XPostEmbedSettings = {
@@ -49,6 +50,7 @@ const DEFAULT_SETTINGS: XPostEmbedSettings = {
 	includeMetrics: false,
 	includeAuthorBio: false,
 	metadataAtTop: false,
+	separatorPosition: "none",
 };
 
 // --- Helpers ---
@@ -79,6 +81,10 @@ interface FxTweet {
 		all?: { url: string }[];
 	};
 	quote?: FxTweet;
+	replying_to?: {
+		screen_name?: string;
+		post?: string;
+	} | null;
 }
 
 interface FxThreadResponse {
@@ -280,12 +286,15 @@ export default class XPostEmbedPlugin extends Plugin {
 
 					const toCursor = editor.getCursor("to");
 
-					try {
-						const uniqueUrls = Array.from(new Set(matches));
+					const uniqueUrls = Array.from(new Set(matches));
+					const fetchNotice = new Notice(
+						uniqueUrls.length > 1
+							? `\u231B Fetching ${uniqueUrls.length} tweets...`
+							: "\u231B Fetching tweet...",
+						0 // Duration 0 = stays until dismissed
+					);
 
-						if (uniqueUrls.length > 1) {
-							new Notice(`Fetching ${uniqueUrls.length} tweets...`);
-						}
+					try {
 
 						const promises = uniqueUrls.map(url => this.fetchTweetData(url));
 						const results = await Promise.allSettled(promises);
@@ -323,6 +332,8 @@ export default class XPostEmbedPlugin extends Plugin {
 							editor.replaceSelection("\n" + newText);
 						}
 
+						fetchNotice.hide();
+
 						if (hasErrors) {
 							new Notice("Failed to fetch some tweets. Left as raw links");
 						}
@@ -338,6 +349,7 @@ export default class XPostEmbedPlugin extends Plugin {
 							);
 						}
 					} catch {
+						fetchNotice.hide();
 						new Notice(
 							"Failed to fetch tweets, links left as-is"
 						);
@@ -388,6 +400,15 @@ export default class XPostEmbedPlugin extends Plugin {
 			const author = tweet.author ?? {};
 			const date = this.formatDateFromFx(tweet.created_at ?? "");
 
+			// Try to reconstruct thread if this tweet is part of a self-thread
+			let thread_texts: string[];
+			if (tweet.replying_to?.post && tweet.replying_to?.screen_name?.toLowerCase() === (author.screen_name ?? "").toLowerCase()) {
+				const threadTweets = await this.reconstructThread(tweet);
+				thread_texts = threadTweets.map((t: FxTweet) => this.extractTextWithQuotes(t));
+			} else {
+				thread_texts = [this.extractTextWithQuotes(tweet)];
+			}
+
 			return {
 				url: tweet.url || tweetUrl,
 				author_name: author.name || author.screen_name || "Unknown",
@@ -396,7 +417,7 @@ export default class XPostEmbedPlugin extends Plugin {
 					? `https://x.com/${author.screen_name}`
 					: "",
 				tweet_text: tweet.text || "",
-				thread_texts: [this.extractTextWithQuotes(tweet)],
+				thread_texts,
 				tweet_date: date,
 				media_urls: tweet.media?.all?.map((m: { url: string }) => m.url) || [],
 				community_note: tweet.community_note || null,
@@ -419,8 +440,12 @@ export default class XPostEmbedPlugin extends Plugin {
 		const author = focalTweet.author ?? json.author ?? {};
 
 		let thread_texts: string[] = [];
-		if (json.thread && Array.isArray(json.thread)) {
+		if (json.thread && Array.isArray(json.thread) && json.thread.length > 0) {
 			thread_texts = json.thread.map((t: FxTweet) => this.extractTextWithQuotes(t));
+		} else if (focalTweet.replying_to?.post && focalTweet.replying_to?.screen_name?.toLowerCase() === (focalTweet.author?.screen_name ?? author.screen_name ?? "").toLowerCase()) {
+			// Thread endpoint returned null/empty — reconstruct by walking reply chain
+			const threadTweets = await this.reconstructThread(focalTweet);
+			thread_texts = threadTweets.map((t: FxTweet) => this.extractTextWithQuotes(t));
 		} else {
 			thread_texts = [this.extractTextWithQuotes(focalTweet)];
 		}
@@ -478,6 +503,45 @@ export default class XPostEmbedPlugin extends Plugin {
 			}
 		}
 		return null;
+	}
+
+	/**
+	 * Walk the replying_to chain backwards to reconstruct a self-thread.
+	 * Returns tweets in chronological order (oldest first).
+	 */
+	private async reconstructThread(focalTweet: FxTweet): Promise<FxTweet[]> {
+		const authorScreenName = focalTweet.author?.screen_name?.toLowerCase();
+		if (!authorScreenName) return [focalTweet];
+
+		const tweets: FxTweet[] = [focalTweet];
+		let current = focalTweet;
+		const maxDepth = 50; // Safety limit
+
+		while (tweets.length < maxDepth) {
+			const parentId = current.replying_to?.post;
+			const parentAuthor = current.replying_to?.screen_name?.toLowerCase();
+
+			// Stop if no parent, or parent is a different author (not a self-thread)
+			if (!parentId || parentAuthor !== authorScreenName) break;
+
+			try {
+				const apiUrl = `https://api.fxtwitter.com/i/status/${parentId}`;
+				const response = await this.requestWithRetries(
+					() => requestUrl({ url: apiUrl, method: "GET" }),
+					2,
+					1000
+				);
+				const json = response.json as FxSingleResponse;
+				if (json.code !== 200 || !json.tweet) break;
+
+				tweets.unshift(json.tweet); // Prepend (oldest first)
+				current = json.tweet;
+			} catch {
+				break; // Stop on fetch errors
+			}
+		}
+
+		return tweets;
 	}
 
 	private extractTextWithQuotes(tweet: FxTweet): string {
@@ -617,6 +681,7 @@ export default class XPostEmbedPlugin extends Plugin {
 
 		const lines = combinedText.replace(/\n/g, "\n> ");
 
+		let result: string;
 		switch (format) {
 			case "callout": {
 				const displayDate =
@@ -629,16 +694,26 @@ export default class XPostEmbedPlugin extends Plugin {
 				let calloutLines = lines;
 				const footerLines = footer.replace(/\n/g, "\n> ");
 				if (this.settings.metadataAtTop) {
-					return `> [!quote] @${author_name} \u2014 ${displayDate}\n> ${footerLines}\n>\n> ${calloutLines}`;
+					result = `> [!quote] @${author_name} \u2014 ${displayDate}\n> ${footerLines}\n>\n> ${calloutLines}`;
+				} else {
+					result = `> [!quote] @${author_name} \u2014 ${displayDate}\n> ${calloutLines}\n>\n> ${footerLines}`;
 				}
-				return `> [!quote] @${author_name} \u2014 ${displayDate}\n> ${calloutLines}\n>\n> ${footerLines}`;
+				break;
 			}
 			case "plain":
-				return this.settings.metadataAtTop ? `${footer}\n\n${combinedText}` : `${combinedText}\n\n${footer}`;
+				result = this.settings.metadataAtTop ? `${footer}\n\n${combinedText}` : `${combinedText}\n\n${footer}`;
+				break;
 			case "blockquote":
 			default:
-				return this.settings.metadataAtTop ? `> ${footer.replace(/\n/g, "\n> ")}\n>\n> ${lines}` : `> ${lines}\n> ${footer.replace(/\n/g, "\n> ")}`;
+				result = this.settings.metadataAtTop ? `> ${footer.replace(/\n/g, "\n> ")}\n>\n> ${lines}` : `> ${lines}\n> ${footer.replace(/\n/g, "\n> ")}`;
+				break;
 		}
+
+		const sep = this.settings.separatorPosition;
+		if (sep === "above" || sep === "both") result = `---\n${result}`;
+		if (sep === "below" || sep === "both") result = `${result}\n---`;
+
+		return result;
 	}
 
 	// --- Parse unparsed tweet links in-place ---
@@ -671,10 +746,12 @@ export default class XPostEmbedPlugin extends Plugin {
 			return;
 		}
 
-		new Notice(`Fetching ${uniqueUrls.length} new tweet(s)...`);
+		const parseNotice = new Notice(`\u231B Fetching ${uniqueUrls.length} new tweet(s)...`, 0);
 
 		const promises = uniqueUrls.map((url) => this.fetchTweetData(url));
 		const results = await Promise.allSettled(promises);
+
+		parseNotice.hide();
 
 		let newContent = content;
 		let hasErrors = false;
@@ -741,10 +818,11 @@ export default class XPostEmbedPlugin extends Plugin {
 					return;
 				}
 
-				new Notice("Fetching tweet data...");
+				const modalNotice = new Notice("\u231B Fetching tweet data...", 0);
 				void (async () => {
 					try {
 						const tweetData = await this.fetchTweetData(tweetUrl);
+						modalNotice.hide();
 						const savedPath = await this.saveTweetAsNote(tweetData);
 						new Notice("Tweet saved successfully!");
 
@@ -767,6 +845,7 @@ export default class XPostEmbedPlugin extends Plugin {
 							}
 						}
 					} catch {
+						modalNotice.hide();
 						new Notice("Error fetching tweet data");
 					}
 				})();
@@ -1130,6 +1209,26 @@ class XPostEmbedSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.metadataAtTop)
 					.onChange(async (value) => {
 						this.plugin.settings.metadataAtTop = value;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Horizontal rule separators")
+			.setDesc("Add --- separators above and/or below each embedded tweet.")
+			.addDropdown((dropdown) =>
+				dropdown
+					.addOption("none", "None")
+					.addOption("above", "Above")
+					.addOption("below", "Below")
+					.addOption("both", "Above & below")
+					.setValue(this.plugin.settings.separatorPosition)
+					.onChange(async (value: string) => {
+						this.plugin.settings.separatorPosition = value as
+							| "none"
+							| "above"
+							| "below"
+							| "both";
 						await this.plugin.saveSettings();
 					})
 			);
