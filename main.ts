@@ -531,13 +531,26 @@ export default class XPostEmbedPlugin extends Plugin {
 					2,
 					1000
 				);
+
+				if (!response || response.status !== 200) {
+					console.warn(`[XPostEmbed] Failed to fetch parent tweet ${parentId}: HTTP ${response?.status}`);
+					break;
+				}
+
 				const json = response.json as FxSingleResponse;
-				if (json.code !== 200 || !json.tweet) break;
+				if (json.code !== 200 || !json.tweet) {
+					console.warn(`[XPostEmbed] Unexpected API response for tweet ${parentId}:`, json);
+					break;
+				}
 
 				tweets.unshift(json.tweet); // Prepend (oldest first)
 				current = json.tweet;
-			} catch {
-				break; // Stop on fetch errors
+
+				// Delay between requests to avoid rate-limiting by FxTwitter
+				await new Promise(resolve => setTimeout(resolve, 500));
+			} catch (error) {
+				console.error(`[XPostEmbed] Error fetching parent tweet ${parentId}:`, error);
+				break;
 			}
 		}
 
