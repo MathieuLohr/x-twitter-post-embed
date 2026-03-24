@@ -608,6 +608,13 @@ export default class XPostEmbedPlugin extends Plugin {
 
 	// --- Shared utilities ---
 
+	async fetchWithTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+		const timeout = new Promise<never>((_, reject) =>
+			setTimeout(() => reject(new Error(`Request timed out after ${ms}ms`)), ms)
+		);
+		return Promise.race([promise, timeout]);
+	}
+
 	async requestWithRetries<T>(
 		fn: () => Promise<T>,
 		retries: number,
@@ -615,7 +622,7 @@ export default class XPostEmbedPlugin extends Plugin {
 	): Promise<T> {
 		for (let i = 0; i < retries; i++) {
 			try {
-				return await fn();
+				return await this.fetchWithTimeout(fn(), 5000);
 			} catch (e) {
 				if (i === retries - 1) throw e;
 				await new Promise((r) => setTimeout(r, delay));
@@ -761,8 +768,17 @@ export default class XPostEmbedPlugin extends Plugin {
 
 		const parseNotice = new Notice(`\u231B Fetching ${uniqueUrls.length} new tweet(s)...`, 0);
 
-		const promises = uniqueUrls.map((url) => this.fetchTweetData(url));
-		const results = await Promise.allSettled(promises);
+		// Process in chunks of 3 to avoid flooding the FxTwitter API
+		const results: PromiseSettledResult<TweetData>[] = [];
+		const chunkSize = 3;
+		for (let i = 0; i < uniqueUrls.length; i += chunkSize) {
+			const chunk = uniqueUrls.slice(i, i + chunkSize);
+			const chunkResults = await Promise.allSettled(chunk.map(url => this.fetchTweetData(url)));
+			results.push(...chunkResults);
+			if (i + chunkSize < uniqueUrls.length) {
+				await new Promise(r => setTimeout(r, 1500));
+			}
+		}
 
 		parseNotice.hide();
 
@@ -774,11 +790,7 @@ export default class XPostEmbedPlugin extends Plugin {
 			const res = results[i];
 			const url = uniqueUrls[i];
 			if (res.status === "fulfilled") {
-				const formatted = this.formatTweetEmbed(
-					res.value,
-					this.settings.pasteFormat
-				);
-				// Replace bare URL with embed
+				const formatted = this.formatTweetEmbed(res.value, this.settings.pasteFormat);
 				newContent = newContent.split(url).join("\n\n" + formatted + "\n\n");
 				successfulTweets.push(res.value);
 			} else {
@@ -788,33 +800,24 @@ export default class XPostEmbedPlugin extends Plugin {
 
 		// Clean up excessive newlines
 		newContent = newContent.replace(/\n{3,}/g, "\n\n");
-
 		editor.setValue(newContent);
 
 		if (hasErrors) {
-			new Notice(
-				"Some tweets failed to fetch and were left as raw links"
-			);
+			new Notice("Some tweets failed to fetch and were left as raw links");
 		}
 
-		// Save parsed tweets as notes + update author pages
+		// Write notes sequentially to prevent vault index race conditions
 		if (successfulTweets.length > 0) {
-			const saveResults = await Promise.allSettled(
-				successfulTweets.map((data) =>
-					this.saveTweetAsNote(data).catch((e) => {
-						console.error(
-							"Failed to save parsed tweet as note:",
-							e
-						);
-					})
-				)
-			);
-			const savedCount = saveResults.filter(
-				(r) => r.status === "fulfilled"
-			).length;
-			new Notice(
-				`Parsed ${successfulTweets.length} tweet(s). ${savedCount} saved as note(s).`
-			);
+			let savedCount = 0;
+			for (const data of successfulTweets) {
+				try {
+					await this.saveTweetAsNote(data);
+					savedCount++;
+				} catch (e) {
+					console.error("[XPostEmbed] Failed to save parsed tweet as note:", e);
+				}
+			}
+			new Notice(`Parsed ${successfulTweets.length} tweet(s). ${savedCount} saved as note(s).`);
 		} else {
 			new Notice("No new tweets were successfully parsed.");
 		}
