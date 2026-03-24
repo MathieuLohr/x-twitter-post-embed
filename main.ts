@@ -81,10 +81,10 @@ interface FxTweet {
 		all?: { url: string }[];
 	};
 	quote?: FxTweet;
-	replying_to?: {
-		screen_name?: string;
-		post?: string;
-	} | null;
+	// /2/thread/ returns { screen_name, post }; /i/status/ returns a plain string
+	replying_to?: { screen_name?: string; post?: string } | string | null;
+	// /i/status/ puts the parent tweet ID in a separate field
+	replying_to_status?: string | null;
 }
 
 interface FxThreadResponse {
@@ -403,7 +403,8 @@ export default class XPostEmbedPlugin extends Plugin {
 
 			// Try to reconstruct thread if this tweet is part of a self-thread
 			let thread_texts: string[];
-			if (tweet.replying_to?.post && tweet.replying_to?.screen_name?.toLowerCase() === (author.screen_name ?? "").toLowerCase()) {
+			const singleParent = this.getParentInfo(tweet);
+			if (singleParent && singleParent.parentAuthor === (author.screen_name ?? "").toLowerCase()) {
 				const threadTweets = await this.reconstructThread(tweet);
 				thread_texts = threadTweets.map((t: FxTweet) => this.compileTweetNode(t));
 			} else {
@@ -441,9 +442,12 @@ export default class XPostEmbedPlugin extends Plugin {
 		const author = focalTweet.author ?? json.author ?? {};
 
 		let thread_texts: string[] = [];
+		const threadParent = this.getParentInfo(focalTweet);
+		const focalAuthor = (focalTweet.author?.screen_name ?? author.screen_name ?? "").toLowerCase();
+
 		if (json.thread && Array.isArray(json.thread) && json.thread.length > 0) {
 			thread_texts = json.thread.map((t: FxTweet) => this.compileTweetNode(t));
-		} else if (focalTweet.replying_to?.post && focalTweet.replying_to?.screen_name?.toLowerCase() === (focalTweet.author?.screen_name ?? author.screen_name ?? "").toLowerCase()) {
+		} else if (threadParent && threadParent.parentAuthor === focalAuthor) {
 			// Thread endpoint returned null/empty — reconstruct by walking reply chain
 			const threadTweets = await this.reconstructThread(focalTweet);
 			thread_texts = threadTweets.map((t: FxTweet) => this.compileTweetNode(t));
@@ -507,6 +511,29 @@ export default class XPostEmbedPlugin extends Plugin {
 	}
 
 	/**
+	 * Extract parent tweet ID and author from either API format.
+	 * /2/thread/ returns replying_to as { screen_name, post }.
+	 * /i/status/ returns replying_to as a string + replying_to_status as the ID.
+	 */
+	private getParentInfo(tweet: FxTweet): { parentId: string; parentAuthor: string } | null {
+		const rt = tweet.replying_to;
+		if (!rt) return null;
+
+		if (typeof rt === "object") {
+			// /2/thread/ format
+			if (rt.post && rt.screen_name) return { parentId: rt.post, parentAuthor: rt.screen_name.toLowerCase() };
+			return null;
+		}
+
+		// /i/status/ format: replying_to is the screen name string, replying_to_status is the ID
+		if (typeof rt === "string" && tweet.replying_to_status) {
+			return { parentId: tweet.replying_to_status, parentAuthor: rt.toLowerCase() };
+		}
+
+		return null;
+	}
+
+	/**
 	 * Walk the replying_to chain backwards to reconstruct a self-thread.
 	 * Returns tweets in chronological order (oldest first).
 	 */
@@ -519,11 +546,12 @@ export default class XPostEmbedPlugin extends Plugin {
 		const maxDepth = 50; // Safety limit
 
 		while (tweets.length < maxDepth) {
-			const parentId = current.replying_to?.post;
-			const parentAuthor = current.replying_to?.screen_name?.toLowerCase();
+			const parent = this.getParentInfo(current);
 
 			// Stop if no parent, or parent is a different author (not a self-thread)
-			if (!parentId || parentAuthor !== authorScreenName) break;
+			if (!parent || parent.parentAuthor !== authorScreenName) break;
+
+			const parentId = parent.parentId;
 
 			try {
 				const apiUrl = `https://api.fxtwitter.com/i/status/${parentId}`;
