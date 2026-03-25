@@ -87,13 +87,6 @@ interface FxTweet {
 	replying_to_status?: string | null;
 }
 
-interface FxThreadResponse {
-	code: number;
-	status: FxTweet;
-	thread?: FxTweet[];
-	author?: FxTweet["author"];
-}
-
 interface FxSingleResponse {
 	code: number;
 	tweet?: FxTweet;
@@ -171,7 +164,7 @@ class TweetUrlModal extends Modal {
 					const text = await navigator.clipboard.readText();
 					inputEl.value = text;
 				} catch {
-					new Notice("Clipboard access blocked by OS. Please long-press to paste.");
+					new Notice("Clipboard access blocked. Please long-press to paste.");
 					inputEl.focus();
 				}
 			})();
@@ -290,8 +283,8 @@ export default class XPostEmbedPlugin extends Plugin {
 					const uniqueUrls = Array.from(new Set(matches));
 					const fetchNotice = new Notice(
 						uniqueUrls.length > 1
-							? `\u231B Fetching ${uniqueUrls.length} tweets...`
-							: "\u231B Fetching tweet...",
+							? `Fetching ${uniqueUrls.length} tweets\u2026 \u231B`
+							: "Fetching tweet\u2026 \u231B",
 						0 // Duration 0 = stays until dismissed
 					);
 
@@ -378,7 +371,9 @@ export default class XPostEmbedPlugin extends Plugin {
 		const tweetId = extractTweetId(tweetUrl);
 		if (!tweetId) throw new Error("Could not extract tweet ID");
 
-		const apiUrl = `https://api.fxtwitter.com/2/thread/${tweetId}`;
+		// The /2/thread/ endpoint was deprecated (302 redirects to GitHub wiki).
+		// Use /i/status/ directly and reconstruct threads by walking the reply chain.
+		const apiUrl = `https://api.fxtwitter.com/i/status/${tweetId}`;
 
 		const response = await this.requestWithRetries(
 			() => requestUrl({ url: apiUrl, method: "GET" }),
@@ -386,95 +381,43 @@ export default class XPostEmbedPlugin extends Plugin {
 			2000
 		);
 
-		const json = response.json as FxThreadResponse;
-		if (json.code !== 200 || !json.status) {
-			// Try single status endpoint if thread fails
-			const singleApiUrl = `https://api.fxtwitter.com/i/status/${tweetId}`;
-			const singleResponse = await requestUrl({ url: singleApiUrl, method: "GET" });
-			const singleJson = singleResponse.json as FxSingleResponse;
-
-			if (singleJson.code !== 200 || !singleJson.tweet) {
-				throw new Error(singleJson.message || "FxTwitter API error");
-			}
-
-			const tweet: FxTweet = singleJson.tweet;
-			const author = tweet.author ?? {};
-			const date = this.formatDateFromFx(tweet.created_at ?? "");
-
-			// Try to reconstruct thread if this tweet is part of a self-thread
-			let thread_texts: string[];
-			const singleParent = this.getParentInfo(tweet);
-			if (singleParent && singleParent.parentAuthor === (author.screen_name ?? "").toLowerCase()) {
-				const threadTweets = await this.reconstructThread(tweet);
-				thread_texts = threadTweets.map((t: FxTweet) => this.compileTweetNode(t));
-			} else {
-				thread_texts = [this.compileTweetNode(tweet)];
-			}
-
-			return {
-				url: tweet.url || tweetUrl,
-				author_name: author.name || author.screen_name || "Unknown",
-				author_screen_name: author.screen_name || "",
-				author_url: author.screen_name
-					? `https://x.com/${author.screen_name}`
-					: "",
-				tweet_text: tweet.text || "",
-				thread_texts,
-				tweet_date: date,
-				media_urls: [], // Already inlined per-tweet by compileTweetNode
-				community_note: null, // Already inlined per-tweet by compileTweetNode
-				metrics: {
-					likes: tweet.likes || 0,
-					reposts: tweet.reposts || 0,
-					replies: tweet.replies || 0,
-					views: tweet.views || 0,
-					bookmarks: tweet.bookmarks || 0,
-				},
-				author_bio: {
-					description: author.description || "",
-					location: author.location || "",
-					followers: author.followers || 0,
-				},
-			};
+		const json = response.json as FxSingleResponse;
+		if (json.code !== 200 || !json.tweet) {
+			throw new Error(json.message || "FxTwitter API error");
 		}
 
-		const focalTweet: FxTweet = json.status;
-		const author = focalTweet.author ?? json.author ?? {};
+		const tweet: FxTweet = json.tweet;
+		const author = tweet.author ?? {};
+		const date = this.formatDateFromFx(tweet.created_at ?? "");
 
-		let thread_texts: string[] = [];
-		const threadParent = this.getParentInfo(focalTweet);
-		const focalAuthor = (focalTweet.author?.screen_name ?? author.screen_name ?? "").toLowerCase();
-
-		if (json.thread && Array.isArray(json.thread) && json.thread.length > 0) {
-			thread_texts = json.thread.map((t: FxTweet) => this.compileTweetNode(t));
-		} else if (threadParent && threadParent.parentAuthor === focalAuthor) {
-			// Thread endpoint returned null/empty — reconstruct by walking reply chain
-			const threadTweets = await this.reconstructThread(focalTweet);
+		// Reconstruct thread if this tweet is a self-reply (same author replying to themselves)
+		let thread_texts: string[];
+		const parentInfo = this.getParentInfo(tweet);
+		if (parentInfo && parentInfo.parentAuthor === (author.screen_name ?? "").toLowerCase()) {
+			const threadTweets = await this.reconstructThread(tweet);
 			thread_texts = threadTweets.map((t: FxTweet) => this.compileTweetNode(t));
 		} else {
-			thread_texts = [this.compileTweetNode(focalTweet)];
+			thread_texts = [this.compileTweetNode(tweet)];
 		}
 
-		const date = this.formatDateFromFx(focalTweet.created_at ?? "");
-
 		return {
-			url: focalTweet.url || tweetUrl,
+			url: tweet.url || tweetUrl,
 			author_name: author.name || author.screen_name || "Unknown",
 			author_screen_name: author.screen_name || "",
 			author_url: author.screen_name
 				? `https://x.com/${author.screen_name}`
 				: "",
-			tweet_text: focalTweet.text || "",
+			tweet_text: tweet.text || "",
 			thread_texts,
 			tweet_date: date,
 			media_urls: [], // Already inlined per-tweet by compileTweetNode
 			community_note: null, // Already inlined per-tweet by compileTweetNode
 			metrics: {
-				likes: focalTweet.likes || 0,
-				reposts: focalTweet.reposts || 0,
-				replies: focalTweet.replies || 0,
-				views: focalTweet.views || 0,
-				bookmarks: focalTweet.bookmarks || 0,
+				likes: tweet.likes || 0,
+				reposts: tweet.reposts || 0,
+				replies: tweet.replies || 0,
+				views: tweet.views || 0,
+				bookmarks: tweet.bookmarks || 0,
 			},
 			author_bio: {
 				description: author.description || "",
@@ -511,9 +454,8 @@ export default class XPostEmbedPlugin extends Plugin {
 	}
 
 	/**
-	 * Extract parent tweet ID and author from either API format.
-	 * /2/thread/ returns replying_to as { screen_name, post }.
-	 * /i/status/ returns replying_to as a string + replying_to_status as the ID.
+	 * Extract parent tweet ID and author from the API response.
+	 * /i/status/ returns replying_to as a string (screen name) + replying_to_status as the parent ID.
 	 */
 	private getParentInfo(tweet: FxTweet): { parentId: string; parentAuthor: string } | null {
 		const rt = tweet.replying_to;
@@ -646,10 +588,10 @@ export default class XPostEmbedPlugin extends Plugin {
 	// --- Shared utilities ---
 
 	debounce<T extends (...args: unknown[]) => unknown>(func: T, wait: number): (...args: Parameters<T>) => void {
-		let timeout: ReturnType<typeof setTimeout>;
+		let timeout: number | undefined;
 		return (...args: Parameters<T>) => {
-			clearTimeout(timeout);
-			timeout = setTimeout(() => func(...args), wait);
+			if (timeout !== undefined) window.clearTimeout(timeout);
+			timeout = window.setTimeout(() => func(...args), wait);
 		};
 	}
 
@@ -812,7 +754,7 @@ export default class XPostEmbedPlugin extends Plugin {
 			return;
 		}
 
-		const parseNotice = new Notice(`\u231B Fetching ${uniqueUrls.length} new tweet(s)...`, 0);
+		const parseNotice = new Notice(`Fetching ${uniqueUrls.length} tweet(s)\u2026 \u231B`, 0);
 
 		// Process in chunks of 3 to avoid flooding the FxTwitter API
 		const results: PromiseSettledResult<TweetData>[] = [];
@@ -880,7 +822,7 @@ export default class XPostEmbedPlugin extends Plugin {
 					return;
 				}
 
-				const modalNotice = new Notice("\u231B Fetching tweet data...", 0);
+				const modalNotice = new Notice("Fetching tweet data\u2026 \u231B", 0);
 				void (async () => {
 					try {
 						const tweetData = await this.fetchTweetData(tweetUrl);
@@ -1089,11 +1031,9 @@ export default class XPostEmbedPlugin extends Plugin {
 	// --- Settings persistence ---
 
 	async loadSettings() {
-		this.settings = Object.assign(
-			{},
-			DEFAULT_SETTINGS,
-			await this.loadData() as Partial<XPostEmbedSettings>
-		);
+		// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+		const saved = (await this.loadData()) ?? {};
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, saved as Partial<XPostEmbedSettings>);
 	}
 
 	async saveSettings() {
