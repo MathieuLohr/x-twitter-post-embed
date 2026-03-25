@@ -1031,9 +1031,8 @@ export default class XPostEmbedPlugin extends Plugin {
 	// --- Settings persistence ---
 
 	async loadSettings() {
-		// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
 		const saved = (await this.loadData()) ?? {};
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, saved as Partial<XPostEmbedSettings>);
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, saved);
 	}
 
 	async saveSettings() {
