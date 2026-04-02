@@ -31,6 +31,7 @@ interface XPostEmbedSettings {
 	includeMetrics: boolean;
 	includeAuthorBio: boolean;
 	metadataAtTop: boolean;
+	separatorPosition: "none" | "above" | "below" | "both";
 }
 
 const DEFAULT_SETTINGS: XPostEmbedSettings = {
@@ -49,6 +50,7 @@ const DEFAULT_SETTINGS: XPostEmbedSettings = {
 	includeMetrics: false,
 	includeAuthorBio: false,
 	metadataAtTop: false,
+	separatorPosition: "none",
 };
 
 // --- Helpers ---
@@ -79,13 +81,10 @@ interface FxTweet {
 		all?: { url: string }[];
 	};
 	quote?: FxTweet;
-}
-
-interface FxThreadResponse {
-	code: number;
-	status: FxTweet;
-	thread?: FxTweet[];
-	author?: FxTweet["author"];
+	// /2/thread/ returns { screen_name, post }; /i/status/ returns a plain string
+	replying_to?: { screen_name?: string; post?: string } | string | null;
+	// /i/status/ puts the parent tweet ID in a separate field
+	replying_to_status?: string | null;
 }
 
 interface FxSingleResponse {
@@ -165,7 +164,8 @@ class TweetUrlModal extends Modal {
 					const text = await navigator.clipboard.readText();
 					inputEl.value = text;
 				} catch {
-					new Notice("Failed to read clipboard");
+					new Notice("Clipboard access blocked. Please long-press to paste.");
+					inputEl.focus();
 				}
 			})();
 		});
@@ -280,12 +280,15 @@ export default class XPostEmbedPlugin extends Plugin {
 
 					const toCursor = editor.getCursor("to");
 
-					try {
-						const uniqueUrls = Array.from(new Set(matches));
+					const uniqueUrls = Array.from(new Set(matches));
+					const fetchNotice = new Notice(
+						uniqueUrls.length > 1
+							? `Fetching ${uniqueUrls.length} tweets\u2026 \u231B`
+							: "Fetching tweet\u2026 \u231B",
+						0 // Duration 0 = stays until dismissed
+					);
 
-						if (uniqueUrls.length > 1) {
-							new Notice(`Fetching ${uniqueUrls.length} tweets...`);
-						}
+					try {
 
 						const promises = uniqueUrls.map(url => this.fetchTweetData(url));
 						const results = await Promise.allSettled(promises);
@@ -323,6 +326,8 @@ export default class XPostEmbedPlugin extends Plugin {
 							editor.replaceSelection("\n" + newText);
 						}
 
+						fetchNotice.hide();
+
 						if (hasErrors) {
 							new Notice("Failed to fetch some tweets. Left as raw links");
 						}
@@ -338,6 +343,7 @@ export default class XPostEmbedPlugin extends Plugin {
 							);
 						}
 					} catch {
+						fetchNotice.hide();
 						new Notice(
 							"Failed to fetch tweets, links left as-is"
 						);
@@ -365,7 +371,9 @@ export default class XPostEmbedPlugin extends Plugin {
 		const tweetId = extractTweetId(tweetUrl);
 		if (!tweetId) throw new Error("Could not extract tweet ID");
 
-		const apiUrl = `https://api.fxtwitter.com/2/thread/${tweetId}`;
+		// The /2/thread/ endpoint was deprecated (302 redirects to GitHub wiki).
+		// Use /i/status/ directly and reconstruct threads by walking the reply chain.
+		const apiUrl = `https://api.fxtwitter.com/i/status/${tweetId}`;
 
 		const response = await this.requestWithRetries(
 			() => requestUrl({ url: apiUrl, method: "GET" }),
@@ -373,78 +381,43 @@ export default class XPostEmbedPlugin extends Plugin {
 			2000
 		);
 
-		const json = response.json as FxThreadResponse;
-		if (json.code !== 200 || !json.status) {
-			// Try single status endpoint if thread fails
-			const singleApiUrl = `https://api.fxtwitter.com/i/status/${tweetId}`;
-			const singleResponse = await requestUrl({ url: singleApiUrl, method: "GET" });
-			const singleJson = singleResponse.json as FxSingleResponse;
-
-			if (singleJson.code !== 200 || !singleJson.tweet) {
-				throw new Error(singleJson.message || "FxTwitter API error");
-			}
-
-			const tweet: FxTweet = singleJson.tweet;
-			const author = tweet.author ?? {};
-			const date = this.formatDateFromFx(tweet.created_at ?? "");
-
-			return {
-				url: tweet.url || tweetUrl,
-				author_name: author.name || author.screen_name || "Unknown",
-				author_screen_name: author.screen_name || "",
-				author_url: author.screen_name
-					? `https://x.com/${author.screen_name}`
-					: "",
-				tweet_text: tweet.text || "",
-				thread_texts: [this.extractTextWithQuotes(tweet)],
-				tweet_date: date,
-				media_urls: tweet.media?.all?.map((m: { url: string }) => m.url) || [],
-				community_note: tweet.community_note || null,
-				metrics: {
-					likes: tweet.likes || 0,
-					reposts: tweet.reposts || 0,
-					replies: tweet.replies || 0,
-					views: tweet.views || 0,
-					bookmarks: tweet.bookmarks || 0,
-				},
-				author_bio: {
-					description: author.description || "",
-					location: author.location || "",
-					followers: author.followers || 0,
-				},
-			};
+		const json = response.json as FxSingleResponse;
+		if (json.code !== 200 || !json.tweet) {
+			throw new Error(json.message || "FxTwitter API error");
 		}
 
-		const focalTweet: FxTweet = json.status;
-		const author = focalTweet.author ?? json.author ?? {};
+		const tweet: FxTweet = json.tweet;
+		const author = tweet.author ?? {};
+		const date = this.formatDateFromFx(tweet.created_at ?? "");
 
-		let thread_texts: string[] = [];
-		if (json.thread && Array.isArray(json.thread)) {
-			thread_texts = json.thread.map((t: FxTweet) => this.extractTextWithQuotes(t));
+		// Reconstruct thread if this tweet is a self-reply (same author replying to themselves)
+		let thread_texts: string[];
+		const parentInfo = this.getParentInfo(tweet);
+		if (parentInfo && parentInfo.parentAuthor === (author.screen_name ?? "").toLowerCase()) {
+			const threadTweets = await this.reconstructThread(tweet);
+			thread_texts = threadTweets.map((t: FxTweet) => this.compileTweetNode(t));
 		} else {
-			thread_texts = [this.extractTextWithQuotes(focalTweet)];
+			thread_texts = [this.compileTweetNode(tweet)];
 		}
-
-		const date = this.formatDateFromFx(focalTweet.created_at ?? "");
 
 		return {
-			url: focalTweet.url || tweetUrl,
+			url: tweet.url || tweetUrl,
 			author_name: author.name || author.screen_name || "Unknown",
 			author_screen_name: author.screen_name || "",
 			author_url: author.screen_name
 				? `https://x.com/${author.screen_name}`
 				: "",
-			tweet_text: focalTweet.text || "",
+			tweet_text: tweet.text || "",
 			thread_texts,
 			tweet_date: date,
-			media_urls: focalTweet.media?.all?.map((m: { url: string }) => m.url) || [],
-			community_note: focalTweet.community_note || null,
+			media_urls: [], // Already inlined per-tweet by compileTweetNode
+			community_note: null, // Already inlined per-tweet by compileTweetNode
 			metrics: {
-				likes: focalTweet.likes || 0,
-				reposts: focalTweet.reposts || 0,
-				replies: focalTweet.replies || 0,
-				views: focalTweet.views || 0,
-				bookmarks: focalTweet.bookmarks || 0,
+				likes: tweet.likes || 0,
+				reposts: tweet.reposts || 0,
+				replies: tweet.replies || 0,
+				views: tweet.views || 0,
+				bookmarks: tweet.bookmarks || 0,
 			},
 			author_bio: {
 				description: author.description || "",
@@ -480,22 +453,105 @@ export default class XPostEmbedPlugin extends Plugin {
 		return null;
 	}
 
-	private extractTextWithQuotes(tweet: FxTweet): string {
-		let text = tweet.text || "";
+	/**
+	 * Extract parent tweet ID and author from the API response.
+	 * /i/status/ returns replying_to as a string (screen name) + replying_to_status as the parent ID.
+	 */
+	private getParentInfo(tweet: FxTweet): { parentId: string; parentAuthor: string } | null {
+		const rt = tweet.replying_to;
+		if (!rt) return null;
+
+		if (typeof rt === "object") {
+			// /2/thread/ format
+			if (rt.post && rt.screen_name) return { parentId: rt.post, parentAuthor: rt.screen_name.toLowerCase() };
+			return null;
+		}
+
+		// /i/status/ format: replying_to is the screen name string, replying_to_status is the ID
+		if (typeof rt === "string" && tweet.replying_to_status) {
+			return { parentId: tweet.replying_to_status, parentAuthor: rt.toLowerCase() };
+		}
+
+		return null;
+	}
+
+	/**
+	 * Walk the replying_to chain backwards to reconstruct a self-thread.
+	 * Returns tweets in chronological order (oldest first).
+	 */
+	private async reconstructThread(focalTweet: FxTweet): Promise<FxTweet[]> {
+		const authorScreenName = focalTweet.author?.screen_name?.toLowerCase();
+		if (!authorScreenName) return [focalTweet];
+
+		const tweets: FxTweet[] = [focalTweet];
+		let current = focalTweet;
+		const maxDepth = 50; // Safety limit
+
+		while (tweets.length < maxDepth) {
+			const parent = this.getParentInfo(current);
+
+			// Stop if no parent, or parent is a different author (not a self-thread)
+			if (!parent || parent.parentAuthor !== authorScreenName) break;
+
+			const parentId = parent.parentId;
+
+			try {
+				const apiUrl = `https://api.fxtwitter.com/i/status/${parentId}`;
+				const response = await this.requestWithRetries(
+					() => requestUrl({ url: apiUrl, method: "GET" }),
+					2,
+					1000
+				);
+
+				if (!response || response.status !== 200) {
+					console.warn(`[XPostEmbed] Failed to fetch parent tweet ${parentId}: HTTP ${response?.status}`);
+					break;
+				}
+
+				const json = response.json as FxSingleResponse;
+				if (json.code !== 200 || !json.tweet) {
+					console.warn(`[XPostEmbed] Unexpected API response for tweet ${parentId}:`, json);
+					break;
+				}
+
+				tweets.unshift(json.tweet); // Prepend (oldest first)
+				current = json.tweet;
+
+				// Delay between requests to avoid rate-limiting by FxTwitter
+				await new Promise(resolve => setTimeout(resolve, 500));
+			} catch (error) {
+				console.error(`[XPostEmbed] Error fetching parent tweet ${parentId}:`, error);
+				break;
+			}
+		}
+
+		return tweets;
+	}
+
+	private compileTweetNode(tweet: FxTweet): string {
+		let content = tweet.text || "";
+
+		// Attach media directly below the text it belongs to
+		if (this.settings.includeMedia && tweet.media?.all && tweet.media.all.length > 0) {
+			content += tweet.media.all.map((m: { url: string }) => `\n\n![Embedded Media](${m.url})`).join("");
+		}
+
+		// Format quoted tweet as a nested blockquote
 		if (tweet.quote) {
 			const quoteAuthor =
 				tweet.quote.author?.screen_name ||
 				tweet.quote.author?.name ||
 				"Unknown";
-			const quoteText = this.extractTextWithQuotes(tweet.quote);
-			// Append the quote formatted as a nested quote block
-			text += `\n\n> [!quote] Quoting @${quoteAuthor}\n> ${quoteText.replace(
-				/\n/g,
-				"\n> "
-			)}`;
+			const quoteContent = this.compileTweetNode(tweet.quote);
+			content += `\n\n> [!quote] Quoting @${quoteAuthor}\n> ${quoteContent.replace(/\n/g, "\n> ")}`;
 		}
 
-		return text;
+		// Attach community note to the specific post it belongs to
+		if (this.settings.includeCommunityNote && tweet.community_note) {
+			content += `\n\n> [!warning] Community Note:\n> ${tweet.community_note.replace(/\n/g, "\n> ")}`;
+		}
+
+		return content;
 	}
 
 	// --- oEmbed API (fallback) ---
@@ -531,6 +587,21 @@ export default class XPostEmbedPlugin extends Plugin {
 
 	// --- Shared utilities ---
 
+	debounce<T extends (...args: unknown[]) => unknown>(func: T, wait: number): (...args: Parameters<T>) => void {
+		let timeout: number | undefined;
+		return (...args: Parameters<T>) => {
+			if (timeout !== undefined) window.clearTimeout(timeout);
+			timeout = window.setTimeout(() => func(...args), wait);
+		};
+	}
+
+	async fetchWithTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+		const timeout = new Promise<never>((_, reject) =>
+			setTimeout(() => reject(new Error(`Request timed out after ${ms}ms`)), ms)
+		);
+		return Promise.race([promise, timeout]);
+	}
+
 	async requestWithRetries<T>(
 		fn: () => Promise<T>,
 		retries: number,
@@ -538,7 +609,7 @@ export default class XPostEmbedPlugin extends Plugin {
 	): Promise<T> {
 		for (let i = 0; i < retries; i++) {
 			try {
-				return await fn();
+				return await this.fetchWithTimeout(fn(), 5000);
 			} catch (e) {
 				if (i === retries - 1) throw e;
 				await new Promise((r) => setTimeout(r, delay));
@@ -564,8 +635,8 @@ export default class XPostEmbedPlugin extends Plugin {
 
 			let text = tweetParagraph.textContent || "";
 
-			// Remove trailing t.co links
-			text = text.replace(/\s*https:\/\/t\.co\/\w+\s*$/g, "").trim();
+			// Remove one or more consecutive trailing t.co links
+			text = text.replace(/(?:\s*https:\/\/t\.co\/\w+)+\s*$/g, "").trim();
 
 			return text;
 		} catch {
@@ -577,12 +648,13 @@ export default class XPostEmbedPlugin extends Plugin {
 		try {
 			const parser = new DOMParser();
 			const doc = parser.parseFromString(html, "text/html");
-			const links = doc.querySelectorAll("blockquote.twitter-tweet a");
-			const lastLink = links[links.length - 1];
-			if (lastLink && lastLink.textContent) {
-				return lastLink.textContent.trim();
-			}
-			return null;
+			const links = Array.from(doc.querySelectorAll("blockquote.twitter-tweet a"));
+			// Search from the end for an anchor containing a 4-digit year
+			const dateLink = links.reverse().find(link => {
+				const text = link.textContent?.trim() || "";
+				return text.length > 0 && !text.startsWith("#") && !text.startsWith("@") && /\d{4}/.test(text);
+			});
+			return dateLink ? dateLink.textContent!.trim() : null;
 		} catch {
 			return null;
 		}
@@ -617,6 +689,7 @@ export default class XPostEmbedPlugin extends Plugin {
 
 		const lines = combinedText.replace(/\n/g, "\n> ");
 
+		let result: string;
 		switch (format) {
 			case "callout": {
 				const displayDate =
@@ -629,16 +702,26 @@ export default class XPostEmbedPlugin extends Plugin {
 				let calloutLines = lines;
 				const footerLines = footer.replace(/\n/g, "\n> ");
 				if (this.settings.metadataAtTop) {
-					return `> [!quote] @${author_name} \u2014 ${displayDate}\n> ${footerLines}\n>\n> ${calloutLines}`;
+					result = `> [!quote] @${author_name} \u2014 ${displayDate}\n> ${footerLines}\n>\n> ${calloutLines}`;
+				} else {
+					result = `> [!quote] @${author_name} \u2014 ${displayDate}\n> ${calloutLines}\n>\n> ${footerLines}`;
 				}
-				return `> [!quote] @${author_name} \u2014 ${displayDate}\n> ${calloutLines}\n>\n> ${footerLines}`;
+				break;
 			}
 			case "plain":
-				return this.settings.metadataAtTop ? `${footer}\n\n${combinedText}` : `${combinedText}\n\n${footer}`;
+				result = this.settings.metadataAtTop ? `${footer}\n\n${combinedText}` : `${combinedText}\n\n${footer}`;
+				break;
 			case "blockquote":
 			default:
-				return this.settings.metadataAtTop ? `> ${footer.replace(/\n/g, "\n> ")}\n>\n> ${lines}` : `> ${lines}\n> ${footer.replace(/\n/g, "\n> ")}`;
+				result = this.settings.metadataAtTop ? `> ${footer.replace(/\n/g, "\n> ")}\n>\n> ${lines}` : `> ${lines}\n> ${footer.replace(/\n/g, "\n> ")}`;
+				break;
 		}
+
+		const sep = this.settings.separatorPosition;
+		if (sep === "above" || sep === "both") result = `---\n${result}`;
+		if (sep === "below" || sep === "both") result = `${result}\n---`;
+
+		return result;
 	}
 
 	// --- Parse unparsed tweet links in-place ---
@@ -671,10 +754,21 @@ export default class XPostEmbedPlugin extends Plugin {
 			return;
 		}
 
-		new Notice(`Fetching ${uniqueUrls.length} new tweet(s)...`);
+		const parseNotice = new Notice(`Fetching ${uniqueUrls.length} tweet(s)\u2026 \u231B`, 0);
 
-		const promises = uniqueUrls.map((url) => this.fetchTweetData(url));
-		const results = await Promise.allSettled(promises);
+		// Process in chunks of 3 to avoid flooding the FxTwitter API
+		const results: PromiseSettledResult<TweetData>[] = [];
+		const chunkSize = 3;
+		for (let i = 0; i < uniqueUrls.length; i += chunkSize) {
+			const chunk = uniqueUrls.slice(i, i + chunkSize);
+			const chunkResults = await Promise.allSettled(chunk.map(url => this.fetchTweetData(url)));
+			results.push(...chunkResults);
+			if (i + chunkSize < uniqueUrls.length) {
+				await new Promise(r => setTimeout(r, 1500));
+			}
+		}
+
+		parseNotice.hide();
 
 		let newContent = content;
 		let hasErrors = false;
@@ -684,11 +778,7 @@ export default class XPostEmbedPlugin extends Plugin {
 			const res = results[i];
 			const url = uniqueUrls[i];
 			if (res.status === "fulfilled") {
-				const formatted = this.formatTweetEmbed(
-					res.value,
-					this.settings.pasteFormat
-				);
-				// Replace bare URL with embed
+				const formatted = this.formatTweetEmbed(res.value, this.settings.pasteFormat);
 				newContent = newContent.split(url).join("\n\n" + formatted + "\n\n");
 				successfulTweets.push(res.value);
 			} else {
@@ -698,33 +788,24 @@ export default class XPostEmbedPlugin extends Plugin {
 
 		// Clean up excessive newlines
 		newContent = newContent.replace(/\n{3,}/g, "\n\n");
-
 		editor.setValue(newContent);
 
 		if (hasErrors) {
-			new Notice(
-				"Some tweets failed to fetch and were left as raw links"
-			);
+			new Notice("Some tweets failed to fetch and were left as raw links");
 		}
 
-		// Save parsed tweets as notes + update author pages
+		// Write notes sequentially to prevent vault index race conditions
 		if (successfulTweets.length > 0) {
-			const saveResults = await Promise.allSettled(
-				successfulTweets.map((data) =>
-					this.saveTweetAsNote(data).catch((e) => {
-						console.error(
-							"Failed to save parsed tweet as note:",
-							e
-						);
-					})
-				)
-			);
-			const savedCount = saveResults.filter(
-				(r) => r.status === "fulfilled"
-			).length;
-			new Notice(
-				`Parsed ${successfulTweets.length} tweet(s). ${savedCount} saved as note(s).`
-			);
+			let savedCount = 0;
+			for (const data of successfulTweets) {
+				try {
+					await this.saveTweetAsNote(data);
+					savedCount++;
+				} catch (e) {
+					console.error("[XPostEmbed] Failed to save parsed tweet as note:", e);
+				}
+			}
+			new Notice(`Parsed ${successfulTweets.length} tweet(s). ${savedCount} saved as note(s).`);
 		} else {
 			new Notice("No new tweets were successfully parsed.");
 		}
@@ -741,10 +822,11 @@ export default class XPostEmbedPlugin extends Plugin {
 					return;
 				}
 
-				new Notice("Fetching tweet data...");
+				const modalNotice = new Notice("Fetching tweet data\u2026 \u231B", 0);
 				void (async () => {
 					try {
 						const tweetData = await this.fetchTweetData(tweetUrl);
+						modalNotice.hide();
 						const savedPath = await this.saveTweetAsNote(tweetData);
 						new Notice("Tweet saved successfully!");
 
@@ -767,6 +849,7 @@ export default class XPostEmbedPlugin extends Plugin {
 							}
 						}
 					} catch {
+						modalNotice.hide();
 						new Notice("Error fetching tweet data");
 					}
 				})();
@@ -948,11 +1031,8 @@ export default class XPostEmbedPlugin extends Plugin {
 	// --- Settings persistence ---
 
 	async loadSettings() {
-		this.settings = Object.assign(
-			{},
-			DEFAULT_SETTINGS,
-			await this.loadData() as Partial<XPostEmbedSettings>
-		);
+		const saved = (await this.loadData()) ?? {};
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, saved);
 	}
 
 	async saveSettings() {
@@ -981,16 +1061,14 @@ class XPostEmbedSettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("Tweets folder")
 			.setDesc("Folder where saved tweets are stored.")
-			.addText((text) =>
-				text
-					.setPlaceholder("Tweets")
-					.setValue(this.plugin.settings.tweetsFolder)
-					.onChange(async (value) => {
-						this.plugin.settings.tweetsFolder =
-							value || "Tweets";
-						await this.plugin.saveSettings();
-					})
-			);
+			.addText((text) => {
+				text.setPlaceholder("Tweets").setValue(this.plugin.settings.tweetsFolder);
+				const debouncedSave = this.plugin.debounce(async (value: string) => {
+					this.plugin.settings.tweetsFolder = value || "Tweets";
+					await this.plugin.saveSettings();
+				}, 500);
+				text.onChange(debouncedSave);
+			});
 
 		new Setting(containerEl)
 			.setName("Enable author pages")
@@ -1007,16 +1085,14 @@ class XPostEmbedSettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("Author pages folder")
 			.setDesc("Folder where per-author aggregation pages are stored.")
-			.addText((text) =>
-				text
-					.setPlaceholder("Tweets/authors")
-					.setValue(this.plugin.settings.authorPagesFolder)
-					.onChange(async (value) => {
-						this.plugin.settings.authorPagesFolder =
-							value || "Tweets/Authors";
-						await this.plugin.saveSettings();
-					})
-			);
+			.addText((text) => {
+				text.setPlaceholder("Tweets/authors").setValue(this.plugin.settings.authorPagesFolder);
+				const debouncedSave = this.plugin.debounce(async (value: string) => {
+					this.plugin.settings.authorPagesFolder = value || "Tweets/Authors";
+					await this.plugin.saveSettings();
+				}, 500);
+				text.onChange(debouncedSave);
+			});
 
 		new Setting(containerEl)
 			.setName("Author page order")
@@ -1130,6 +1206,26 @@ class XPostEmbedSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.metadataAtTop)
 					.onChange(async (value) => {
 						this.plugin.settings.metadataAtTop = value;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Horizontal rule separators")
+			.setDesc("Add --- separators above and/or below each embedded tweet.")
+			.addDropdown((dropdown) =>
+				dropdown
+					.addOption("none", "None")
+					.addOption("above", "Above")
+					.addOption("below", "Below")
+					.addOption("both", "Above & below")
+					.setValue(this.plugin.settings.separatorPosition)
+					.onChange(async (value: string) => {
+						this.plugin.settings.separatorPosition = value as
+							| "none"
+							| "above"
+							| "below"
+							| "both";
 						await this.plugin.saveSettings();
 					})
 			);
