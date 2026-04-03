@@ -654,7 +654,7 @@ export default class XPostEmbedPlugin extends Plugin {
 				const text = link.textContent?.trim() || "";
 				return text.length > 0 && !text.startsWith("#") && !text.startsWith("@") && /\d{4}/.test(text);
 			});
-			return dateLink ? dateLink.textContent!.trim() : null;
+			return dateLink?.textContent?.trim() ?? null;
 		} catch {
 			return null;
 		}
