@@ -93,6 +93,19 @@ interface FxSingleResponse {
 	message?: string;
 }
 
+interface FxV2ThreadResponse {
+	code: number;
+	status?: FxTweet;
+	thread?: FxTweet[];
+	author?: {
+		name?: string;
+		screen_name?: string;
+		description?: string;
+		location?: string;
+		followers?: number;
+	};
+}
+
 interface OEmbedResponse {
 	url: string;
 	author_name: string;
@@ -371,8 +384,64 @@ export default class XPostEmbedPlugin extends Plugin {
 		const tweetId = extractTweetId(tweetUrl);
 		if (!tweetId) throw new Error("Could not extract tweet ID");
 
-		// The /2/thread/ endpoint was deprecated (302 redirects to GitHub wiki).
-		// Use /i/status/ directly and reconstruct threads by walking the reply chain.
+		// Try /2/thread/ first (returns full thread from any tweet in the chain)
+		try {
+			const threadData = await this.fetchThreadV2(tweetId, tweetUrl);
+			if (threadData) return threadData;
+		} catch (e) {
+			console.warn("[XPostEmbed] /2/thread/ endpoint failed, falling back to /i/status/:", e);
+		}
+
+		// Fall back to /i/status/ + backward chain-walking
+		return this.fetchSingleAndWalk(tweetId, tweetUrl);
+	}
+
+	private async fetchThreadV2(tweetId: string, tweetUrl: string): Promise<TweetData | null> {
+		const apiUrl = `https://api.fxtwitter.com/2/thread/${tweetId}`;
+		const response = await this.requestWithRetries(
+			() => requestUrl({ url: apiUrl, method: "GET" }),
+			2,
+			1500
+		);
+
+		const json = response.json as FxV2ThreadResponse;
+		if (json.code !== 200 || !json.status) return null;
+
+		const focalTweet = json.status;
+		const author = focalTweet.author ?? json.author ?? {};
+		const date = this.formatDateFromFx(focalTweet.created_at ?? "");
+
+		const tweets = (json.thread && json.thread.length > 0) ? json.thread : [focalTweet];
+		const thread_texts = tweets.map((t: FxTweet) => this.compileTweetNode(t));
+
+		return {
+			url: focalTweet.url || tweetUrl,
+			author_name: author.name || author.screen_name || "Unknown",
+			author_screen_name: author.screen_name || "",
+			author_url: author.screen_name
+				? `https://x.com/${author.screen_name}`
+				: "",
+			tweet_text: focalTweet.text || "",
+			thread_texts,
+			tweet_date: date,
+			media_urls: [],
+			community_note: null,
+			metrics: {
+				likes: focalTweet.likes || 0,
+				reposts: focalTweet.reposts || 0,
+				replies: focalTweet.replies || 0,
+				views: focalTweet.views || 0,
+				bookmarks: focalTweet.bookmarks || 0,
+			},
+			author_bio: {
+				description: author.description || "",
+				location: author.location || "",
+				followers: author.followers || 0,
+			},
+		};
+	}
+
+	private async fetchSingleAndWalk(tweetId: string, tweetUrl: string): Promise<TweetData> {
 		const apiUrl = `https://api.fxtwitter.com/i/status/${tweetId}`;
 
 		const response = await this.requestWithRetries(
@@ -410,8 +479,8 @@ export default class XPostEmbedPlugin extends Plugin {
 			tweet_text: tweet.text || "",
 			thread_texts,
 			tweet_date: date,
-			media_urls: [], // Already inlined per-tweet by compileTweetNode
-			community_note: null, // Already inlined per-tweet by compileTweetNode
+			media_urls: [],
+			community_note: null,
 			metrics: {
 				likes: tweet.likes || 0,
 				reposts: tweet.reposts || 0,
