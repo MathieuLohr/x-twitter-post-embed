@@ -10,6 +10,7 @@ An Obsidian plugin that automatically embeds X (formerly Twitter) post text when
 - **Save as note** — save tweets as individual markdown files
 - **Author pages** — automatically creates per-author aggregation pages with transclusion
 - **Rich metadata** — optionally includes date, media, engagement metrics, community notes, and author bio
+- **Translation** — fetch tweets in a chosen language via FxTwitter (defaults to English; blank to disable)
 - **Quote tweet support** — nested formatting for quoted tweets
 - **Parse existing links** — command to retroactively parse bare tweet URLs in a note
 
@@ -50,6 +51,7 @@ An Obsidian plugin that automatically embeds X (formerly Twitter) post text when
 | Include metrics | Show likes, reposts, etc. | Off |
 | Include community notes | Show community notes | On |
 | Include author bio | Show author description/followers | Off |
+| Translate tweets to language | ISO code (e.g. `en`) for FxTwitter translation; blank disables | `en` |
 
 ## Network Usage
 
