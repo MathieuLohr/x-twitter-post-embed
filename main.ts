@@ -32,6 +32,7 @@ interface XPostEmbedSettings {
 	includeAuthorBio: boolean;
 	metadataAtTop: boolean;
 	separatorPosition: "none" | "above" | "below" | "both";
+	translateToLanguage: string;
 }
 
 const DEFAULT_SETTINGS: XPostEmbedSettings = {
@@ -51,6 +52,7 @@ const DEFAULT_SETTINGS: XPostEmbedSettings = {
 	includeAuthorBio: false,
 	metadataAtTop: false,
 	separatorPosition: "none",
+	translateToLanguage: "en",
 };
 
 // --- Helpers ---
@@ -85,6 +87,12 @@ interface FxTweet {
 	replying_to?: { screen_name?: string; post?: string } | string | null;
 	// /i/status/ puts the parent tweet ID in a separate field
 	replying_to_status?: string | null;
+	// Present when the API URL included a translation target (e.g. /i/status/:id/en)
+	translation?: {
+		text?: string;
+		source_lang?: string;
+		target_lang?: string;
+	};
 }
 
 interface FxSingleResponse {
@@ -396,8 +404,13 @@ export default class XPostEmbedPlugin extends Plugin {
 		return this.fetchSingleAndWalk(tweetId, tweetUrl);
 	}
 
+	private translationSuffix(): string {
+		const lang = this.settings.translateToLanguage.trim().toLowerCase();
+		return lang ? `/${encodeURIComponent(lang)}` : "";
+	}
+
 	private async fetchThreadV2(tweetId: string, tweetUrl: string): Promise<TweetData | null> {
-		const apiUrl = `https://api.fxtwitter.com/2/thread/${tweetId}`;
+		const apiUrl = `https://api.fxtwitter.com/2/thread/${tweetId}${this.translationSuffix()}`;
 		const response = await this.requestWithRetries(
 			() => requestUrl({ url: apiUrl, method: "GET" }),
 			2,
@@ -421,7 +434,7 @@ export default class XPostEmbedPlugin extends Plugin {
 			author_url: author.screen_name
 				? `https://x.com/${author.screen_name}`
 				: "",
-			tweet_text: focalTweet.text || "",
+			tweet_text: this.tweetText(focalTweet),
 			thread_texts,
 			tweet_date: date,
 			media_urls: [],
@@ -442,7 +455,7 @@ export default class XPostEmbedPlugin extends Plugin {
 	}
 
 	private async fetchSingleAndWalk(tweetId: string, tweetUrl: string): Promise<TweetData> {
-		const apiUrl = `https://api.fxtwitter.com/i/status/${tweetId}`;
+		const apiUrl = `https://api.fxtwitter.com/i/status/${tweetId}${this.translationSuffix()}`;
 
 		const response = await this.requestWithRetries(
 			() => requestUrl({ url: apiUrl, method: "GET" }),
@@ -476,7 +489,7 @@ export default class XPostEmbedPlugin extends Plugin {
 			author_url: author.screen_name
 				? `https://x.com/${author.screen_name}`
 				: "",
-			tweet_text: tweet.text || "",
+			tweet_text: this.tweetText(tweet),
 			thread_texts,
 			tweet_date: date,
 			media_urls: [],
@@ -565,7 +578,7 @@ export default class XPostEmbedPlugin extends Plugin {
 			const parentId = parent.parentId;
 
 			try {
-				const apiUrl = `https://api.fxtwitter.com/i/status/${parentId}`;
+				const apiUrl = `https://api.fxtwitter.com/i/status/${parentId}${this.translationSuffix()}`;
 				const response = await this.requestWithRetries(
 					() => requestUrl({ url: apiUrl, method: "GET" }),
 					2,
@@ -597,8 +610,12 @@ export default class XPostEmbedPlugin extends Plugin {
 		return tweets;
 	}
 
+	private tweetText(tweet: FxTweet): string {
+		return tweet.translation?.text || tweet.text || "";
+	}
+
 	private compileTweetNode(tweet: FxTweet): string {
-		let content = tweet.text || "";
+		let content = this.tweetText(tweet);
 
 		// Attach media directly below the text it belongs to
 		if (this.settings.includeMedia && tweet.media?.all && tweet.media.all.length > 0) {
@@ -1300,6 +1317,20 @@ class XPostEmbedSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl).setName("Data extras").setHeading();
+
+		new Setting(containerEl)
+			.setName("Translate tweets to language")
+			.setDesc(
+				"ISO language code (e.g. en, fr, es) to request a translated tweet from FxTwitter. Leave blank to keep the original language. Only applies to FxTwitter; the oEmbed fallback returns the original text."
+			)
+			.addText((text) => {
+				text.setPlaceholder("en").setValue(this.plugin.settings.translateToLanguage);
+				const debouncedSave = this.plugin.debounce(async (value: string) => {
+					this.plugin.settings.translateToLanguage = value.trim().toLowerCase();
+					await this.plugin.saveSettings();
+				}, 500);
+				text.onChange(debouncedSave);
+			});
 
 		new Setting(containerEl)
 			.setName("Include media")
