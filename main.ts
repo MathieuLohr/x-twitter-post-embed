@@ -27,6 +27,10 @@ interface XPostEmbedSettings {
 	saveOnPaste: boolean;
 	includeTweetDate: boolean;
 	mediaMode: "none" | "images" | "all";
+	mediaWidth: number;
+	imageSize: "small" | "medium" | "large" | "orig";
+	downloadMediaLocally: boolean;
+	mediaAttachmentsFolder: string;
 	includeCommunityNote: boolean;
 	includeMetrics: boolean;
 	includeAuthorBio: boolean;
@@ -47,6 +51,10 @@ const DEFAULT_SETTINGS: XPostEmbedSettings = {
 	saveOnPaste: false,
 	includeTweetDate: false,
 	mediaMode: "all",
+	mediaWidth: 600,
+	imageSize: "medium",
+	downloadMediaLocally: false,
+	mediaAttachmentsFolder: "Tweets/Media",
 	includeCommunityNote: true,
 	includeMetrics: false,
 	includeAuthorBio: false,
@@ -427,7 +435,7 @@ export default class XPostEmbedPlugin extends Plugin {
 		const date = this.formatDateFromFx(focalTweet.created_at ?? "");
 
 		const tweets = (json.thread && json.thread.length > 0) ? json.thread : [focalTweet];
-		const thread_texts = tweets.map((t: FxTweet) => this.compileTweetNode(t));
+		const thread_texts = await Promise.all(tweets.map((t: FxTweet) => this.compileTweetNode(t)));
 
 		return {
 			url: focalTweet.url || tweetUrl,
@@ -479,9 +487,9 @@ export default class XPostEmbedPlugin extends Plugin {
 		const parentInfo = this.getParentInfo(tweet);
 		if (parentInfo && parentInfo.parentAuthor === (author.screen_name ?? "").toLowerCase()) {
 			const threadTweets = await this.reconstructThread(tweet);
-			thread_texts = threadTweets.map((t: FxTweet) => this.compileTweetNode(t));
+			thread_texts = await Promise.all(threadTweets.map((t: FxTweet) => this.compileTweetNode(t)));
 		} else {
-			thread_texts = [this.compileTweetNode(tweet)];
+			thread_texts = [await this.compileTweetNode(tweet)];
 		}
 
 		return {
@@ -629,13 +637,16 @@ export default class XPostEmbedPlugin extends Plugin {
 		return (tweet.media.all ?? []).map((m) => m.url);
 	}
 
-	private compileTweetNode(tweet: FxTweet): string {
+	private async compileTweetNode(tweet: FxTweet): Promise<string> {
 		let content = this.tweetText(tweet);
 
 		// Attach media directly below the text it belongs to
 		const mediaUrls = this.selectMediaUrls(tweet);
 		if (mediaUrls.length > 0) {
-			content += mediaUrls.map((url) => `\n\n![Embedded Media](${url})`).join("");
+			const embeds = await Promise.all(
+				mediaUrls.map((url) => this.renderMediaEmbed(url))
+			);
+			content += embeds.map((e) => `\n\n${e}`).join("");
 		}
 
 		// Format quoted tweet as a nested blockquote
@@ -644,7 +655,7 @@ export default class XPostEmbedPlugin extends Plugin {
 				tweet.quote.author?.screen_name ||
 				tweet.quote.author?.name ||
 				"Unknown";
-			const quoteContent = this.compileTweetNode(tweet.quote);
+			const quoteContent = await this.compileTweetNode(tweet.quote);
 			content += `\n\n> [!quote] Quoting @${quoteAuthor}\n> ${quoteContent.replace(/\n/g, "\n> ")}`;
 		}
 
@@ -654,6 +665,87 @@ export default class XPostEmbedPlugin extends Plugin {
 		}
 
 		return content;
+	}
+
+	private widthSuffix(): string {
+		const w = this.settings.mediaWidth;
+		return Number.isFinite(w) && w > 0 ? `|${Math.floor(w)}` : "";
+	}
+
+	private async renderMediaEmbed(remoteUrl: string): Promise<string> {
+		const widthHint = this.widthSuffix();
+		const sizedUrl = this.applyImageSize(remoteUrl);
+		if (this.settings.downloadMediaLocally) {
+			try {
+				const localPath = await this.downloadMediaToVault(sizedUrl);
+				return `![[${localPath}${widthHint}]]`;
+			} catch (e) {
+				console.error("[XPostEmbed] Failed to download media, using remote URL:", e);
+			}
+		}
+		return `![Embedded Media${widthHint}](${sizedUrl})`;
+	}
+
+	/**
+	 * Twitter's CDN serves multiple sizes of each image via the `name` query param.
+	 * Rewriting pbs.twimg.com URLs gives 80%+ smaller files at no perceptible quality
+	 * loss for mobile display. No-op for video.twimg.com (videos lack this param).
+	 */
+	private applyImageSize(remoteUrl: string): string {
+		if (this.settings.imageSize === "orig") return remoteUrl;
+		try {
+			const u = new URL(remoteUrl);
+			if (u.hostname !== "pbs.twimg.com") return remoteUrl;
+			u.searchParams.set("name", this.settings.imageSize);
+			return u.toString();
+		} catch {
+			return remoteUrl;
+		}
+	}
+
+	private async downloadMediaToVault(remoteUrl: string): Promise<string> {
+		const folder = normalizePath(this.settings.mediaAttachmentsFolder || "Tweets/Media");
+		const folderEntry = this.app.vault.getAbstractFileByPath(folder);
+		if (!folderEntry) {
+			await this.app.vault.createFolder(folder);
+		} else if (!(folderEntry instanceof TFolder)) {
+			throw new Error(`${folder} exists but is not a folder`);
+		}
+
+		const filename = this.mediaFilenameFromUrl(remoteUrl);
+		const filePath = normalizePath(`${folder}/${filename}`);
+
+		const existing = this.app.vault.getAbstractFileByPath(filePath);
+		if (existing instanceof TFile) return filePath;
+
+		const response = await this.requestWithRetries(
+			() => requestUrl({ url: remoteUrl, method: "GET" }),
+			2,
+			1000
+		);
+		if (response.status !== 200) {
+			throw new Error(`HTTP ${response.status} fetching ${remoteUrl}`);
+		}
+
+		// Re-check before write to handle races between parallel downloads
+		const raceCheck = this.app.vault.getAbstractFileByPath(filePath);
+		if (raceCheck instanceof TFile) return filePath;
+
+		await this.app.vault.createBinary(filePath, response.arrayBuffer);
+		return filePath;
+	}
+
+	private mediaFilenameFromUrl(remoteUrl: string): string {
+		let pathname: string;
+		try {
+			pathname = new URL(remoteUrl).pathname;
+		} catch {
+			pathname = remoteUrl;
+		}
+		const segments = pathname.split("/").filter(Boolean);
+		// Last 2 segments improves uniqueness (Twitter video URLs reuse leaf names like "abc.mp4")
+		const tail = segments.slice(-2).join("_") || "media";
+		return tail.replace(/[\\/:*?"<>|#^[\]]/g, "_");
 	}
 
 	// --- oEmbed API (fallback) ---
@@ -1367,6 +1459,69 @@ class XPostEmbedSettingTab extends PluginSettingTab {
 						await this.plugin.saveSettings();
 					})
 			);
+
+		new Setting(containerEl)
+			.setName("Image size")
+			.setDesc(
+				"Twitter serves multiple resolutions of every image. Smaller sizes reduce data usage and improve render performance on mobile. Applies to both downloaded and remote-embedded images. (Videos are unaffected.)"
+			)
+			.addDropdown((dropdown) =>
+				dropdown
+					.addOption("small", "Small (~680px)")
+					.addOption("medium", "Medium (~1200px)")
+					.addOption("large", "Large (~2048px)")
+					.addOption("orig", "Original (full resolution)")
+					.setValue(this.plugin.settings.imageSize)
+					.onChange(async (value: string) => {
+						this.plugin.settings.imageSize = value as
+							| "small"
+							| "medium"
+							| "large"
+							| "orig";
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Media display width")
+			.setDesc(
+				"Pixel width applied to embedded media (e.g. 600). 0 disables the hint. Lowering this dramatically improves render performance on mobile."
+			)
+			.addText((text) => {
+				text.setPlaceholder("600").setValue(String(this.plugin.settings.mediaWidth));
+				const debouncedSave = this.plugin.debounce(async (value: string) => {
+					const parsed = parseInt(value, 10);
+					this.plugin.settings.mediaWidth = Number.isFinite(parsed) && parsed >= 0 ? parsed : 600;
+					await this.plugin.saveSettings();
+				}, 500);
+				text.onChange(debouncedSave);
+			});
+
+		new Setting(containerEl)
+			.setName("Download media locally")
+			.setDesc(
+				"Download tweet images and videos into the vault and embed them as local files. Avoids re-fetching remote URLs on every render (big mobile win). Creates files in the attachments folder below whenever a tweet is pasted or saved."
+			)
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.downloadMediaLocally)
+					.onChange(async (value) => {
+						this.plugin.settings.downloadMediaLocally = value;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Media attachments folder")
+			.setDesc("Folder where downloaded tweet media is stored.")
+			.addText((text) => {
+				text.setPlaceholder("Tweets/Media").setValue(this.plugin.settings.mediaAttachmentsFolder);
+				const debouncedSave = this.plugin.debounce(async (value: string) => {
+					this.plugin.settings.mediaAttachmentsFolder = value || "Tweets/Media";
+					await this.plugin.saveSettings();
+				}, 500);
+				text.onChange(debouncedSave);
+			});
 
 		new Setting(containerEl)
 			.setName("Include community note")
