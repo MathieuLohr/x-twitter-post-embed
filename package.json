@@ -1,6 +1,6 @@
 {
 	"name": "obsidian-x-twitter-post-embed",
-	"version": "1.0.6",
+	"version": "1.0.7",
 	"description": "Obsidian plugin to auto-embed X/Twitter posts on paste",
 	"main": "main.js",
 	"scripts": {
