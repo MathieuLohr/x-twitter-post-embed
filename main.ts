@@ -26,7 +26,7 @@ interface XPostEmbedSettings {
 	autoPasteEmbed: boolean;
 	saveOnPaste: boolean;
 	includeTweetDate: boolean;
-	includeMedia: boolean;
+	mediaMode: "none" | "images" | "all";
 	includeCommunityNote: boolean;
 	includeMetrics: boolean;
 	includeAuthorBio: boolean;
@@ -46,7 +46,7 @@ const DEFAULT_SETTINGS: XPostEmbedSettings = {
 	autoPasteEmbed: true,
 	saveOnPaste: false,
 	includeTweetDate: false,
-	includeMedia: true,
+	mediaMode: "all",
 	includeCommunityNote: true,
 	includeMetrics: false,
 	includeAuthorBio: false,
@@ -81,6 +81,8 @@ interface FxTweet {
 	};
 	media?: {
 		all?: { url: string }[];
+		photos?: { url: string }[];
+		videos?: { url: string }[];
 	};
 	quote?: FxTweet;
 	// /2/thread/ returns { screen_name, post }; /i/status/ returns a plain string
@@ -614,12 +616,26 @@ export default class XPostEmbedPlugin extends Plugin {
 		return tweet.translation?.text || tweet.text || "";
 	}
 
+	private selectMediaUrls(tweet: FxTweet): string[] {
+		const mode = this.settings.mediaMode;
+		if (mode === "none" || !tweet.media) return [];
+		const photos = tweet.media.photos ?? [];
+		if (mode === "images") return photos.map((m) => m.url);
+		// "all": prefer typed arrays, fall back to media.all for older API shapes
+		const videos = tweet.media.videos ?? [];
+		if (photos.length || videos.length) {
+			return [...photos, ...videos].map((m) => m.url);
+		}
+		return (tweet.media.all ?? []).map((m) => m.url);
+	}
+
 	private compileTweetNode(tweet: FxTweet): string {
 		let content = this.tweetText(tweet);
 
 		// Attach media directly below the text it belongs to
-		if (this.settings.includeMedia && tweet.media?.all && tweet.media.all.length > 0) {
-			content += tweet.media.all.map((m: { url: string }) => `\n\n![Embedded Media](${m.url})`).join("");
+		const mediaUrls = this.selectMediaUrls(tweet);
+		if (mediaUrls.length > 0) {
+			content += mediaUrls.map((url) => `\n\n![Embedded Media](${url})`).join("");
 		}
 
 		// Format quoted tweet as a nested blockquote
@@ -761,7 +777,7 @@ export default class XPostEmbedPlugin extends Plugin {
 			combinedText += `\n\n> [!warning] Community Note:\n> ${community_note.replace(/\n/g, "\n> ")}`;
 		}
 
-		if (this.settings.includeMedia && media_urls && media_urls.length > 0) {
+		if (this.settings.mediaMode !== "none" && media_urls && media_urls.length > 0) {
 			media_urls.forEach(mUrl => {
 				combinedText += `\n\n![Embedded Media](${mUrl})`;
 			});
@@ -1077,7 +1093,7 @@ export default class XPostEmbedPlugin extends Plugin {
 			combinedText += `\n\n> [!warning] Community Note:\n> ${data.community_note.replace(/\n/g, "\n> ")}`;
 		}
 
-		if (this.settings.includeMedia && data.media_urls && data.media_urls.length > 0) {
+		if (this.settings.mediaMode !== "none" && data.media_urls && data.media_urls.length > 0) {
 			data.media_urls.forEach(mUrl => {
 				combinedText += `\n\n![Embedded Media](${mUrl})`;
 			});
@@ -1118,6 +1134,11 @@ export default class XPostEmbedPlugin extends Plugin {
 
 	async loadSettings() {
 		const saved = (await this.loadData()) ?? {};
+		// Migrate legacy `includeMedia` (boolean) → `mediaMode` — default everyone to "all"
+		if ("includeMedia" in saved && saved.mediaMode === undefined) {
+			saved.mediaMode = "all";
+		}
+		delete saved.includeMedia;
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, saved);
 	}
 
@@ -1333,13 +1354,16 @@ class XPostEmbedSettingTab extends PluginSettingTab {
 			});
 
 		new Setting(containerEl)
-			.setName("Include media")
-			.setDesc("Append image and video attachments natively rendered as Markdown images.")
-			.addToggle((toggle) =>
-				toggle
-					.setValue(this.plugin.settings.includeMedia)
+			.setName("Media to include")
+			.setDesc("Choose which attachments are appended below tweet text.")
+			.addDropdown((dropdown) =>
+				dropdown
+					.addOption("none", "None")
+					.addOption("images", "Images only")
+					.addOption("all", "Images and videos")
+					.setValue(this.plugin.settings.mediaMode)
 					.onChange(async (value) => {
-						this.plugin.settings.includeMedia = value;
+						this.plugin.settings.mediaMode = value as "none" | "images" | "all";
 						await this.plugin.saveSettings();
 					})
 			);
