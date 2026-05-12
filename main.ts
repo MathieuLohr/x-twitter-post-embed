@@ -233,6 +233,49 @@ class TweetUrlModal extends Modal {
 	}
 }
 
+class ConfirmModal extends Modal {
+	private resolved = false;
+	constructor(
+		app: App,
+		private heading: string,
+		private body: string,
+		private confirmLabel: string,
+		private onChoose: (proceed: boolean) => void
+	) {
+		super(app);
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.createEl("h2", { text: this.heading });
+		this.body.split("\n\n").forEach((para) => {
+			contentEl.createEl("p", { text: para });
+		});
+
+		const row = contentEl.createDiv({ cls: "x-post-embed-controls-row" });
+		const cancelBtn = row.createEl("button", { text: "Cancel" });
+		const confirmBtn = row.createEl("button", { text: this.confirmLabel });
+		confirmBtn.addClass("mod-cta");
+		cancelBtn.addEventListener("click", () => this.finish(false));
+		confirmBtn.addEventListener("click", () => this.finish(true));
+	}
+
+	private finish(proceed: boolean) {
+		if (this.resolved) return;
+		this.resolved = true;
+		this.onChoose(proceed);
+		this.close();
+	}
+
+	onClose() {
+		if (!this.resolved) {
+			this.resolved = true;
+			this.onChoose(false);
+		}
+		this.contentEl.empty();
+	}
+}
+
 // --- Plugin ---
 
 export default class XPostEmbedPlugin extends Plugin {
@@ -272,6 +315,24 @@ export default class XPostEmbedPlugin extends Plugin {
 				return;
 			}
 			await this.parseUnparsedLinks(view.editor);
+		});
+
+		// Migrate media in current note (idempotent — applies current media settings)
+		this.addCommand({
+			id: "migrate-media-current-note",
+			name: "Migrate tweet media in current note",
+			editorCallback: async (editor: Editor) => {
+				await this.migrateMediaCurrentNote(editor);
+			},
+		});
+
+		// Migrate media across all saved tweet notes
+		this.addCommand({
+			id: "migrate-media-all-tweets",
+			name: "Migrate tweet media in all saved tweet notes",
+			callback: async () => {
+				await this.migrateMediaAllTweets();
+			},
 		});
 
 		// Settings tab
@@ -1003,6 +1064,160 @@ export default class XPostEmbedPlugin extends Plugin {
 		} else {
 			new Notice("No new tweets were successfully parsed.");
 		}
+	}
+
+	// --- Migrate media in existing notes ---
+
+	/**
+	 * Rewrite existing tweet-media embeds in `content` to match current media settings:
+	 * applies image-size rewrite (?name=...), width hint (|600), and optional local download.
+	 * Idempotent: re-running on already-migrated content is a no-op.
+	 */
+	private async migrateMediaInContent(
+		content: string
+	): Promise<{ content: string; rewrites: number; downloads: number; errors: number }> {
+		const widthHint = this.widthSuffix();
+		const attachmentsFolder = normalizePath(
+			this.settings.mediaAttachmentsFolder || "Tweets/Media"
+		);
+		let rewrites = 0;
+		let downloads = 0;
+		let errors = 0;
+
+		// --- Pass 1: remote embeds ![Embedded Media|N?](url) ---
+		const remotePattern = /!\[Embedded Media(?:\|\d+)?\]\((https?:\/\/[^)\s]+)\)/g;
+		const remoteHits: { match: string; url: string }[] = [];
+		let m: RegExpExecArray | null;
+		while ((m = remotePattern.exec(content)) !== null) {
+			remoteHits.push({ match: m[0], url: m[1] });
+		}
+
+		// Process sequentially so we don't flood the CDN during the optional download step.
+		let newContent = content;
+		for (const { match, url } of remoteHits) {
+			const sizedUrl = this.applyImageSize(url);
+			let replacement: string;
+			if (this.settings.downloadMediaLocally) {
+				try {
+					const localPath = await this.downloadMediaToVault(sizedUrl);
+					replacement = `![[${localPath}${widthHint}]]`;
+					downloads++;
+				} catch (e) {
+					console.error("[XPostEmbed] Migration: failed to download", sizedUrl, e);
+					replacement = `![Embedded Media${widthHint}](${sizedUrl})`;
+					errors++;
+				}
+			} else {
+				replacement = `![Embedded Media${widthHint}](${sizedUrl})`;
+			}
+
+			if (replacement === match) continue;
+
+			const idx = newContent.indexOf(match);
+			if (idx === -1) continue; // safety: a prior pass may have already consumed it
+			newContent =
+				newContent.slice(0, idx) + replacement + newContent.slice(idx + match.length);
+			rewrites++;
+		}
+
+		// --- Pass 2: existing local wikilinks under the attachments folder ---
+		// Normalize width hint only; never touches wikilinks outside the attachments folder.
+		const escapedFolder = attachmentsFolder.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+		const localPattern = new RegExp(
+			`!\\[\\[(${escapedFolder}\\/[^\\]|\\n]+?)(?:\\|\\d+)?\\]\\]`,
+			"g"
+		);
+		newContent = newContent.replace(localPattern, (full, path) => {
+			const updated = `![[${path}${widthHint}]]`;
+			if (updated !== full) rewrites++;
+			return updated;
+		});
+
+		return { content: newContent, rewrites, downloads, errors };
+	}
+
+	async migrateMediaCurrentNote(editor: Editor): Promise<void> {
+		const content = editor.getValue();
+		const notice = new Notice("Migrating media… ⌛", 0);
+		try {
+			const result = await this.migrateMediaInContent(content);
+			notice.hide();
+			if (result.content !== content) {
+				editor.setValue(result.content);
+			}
+			new Notice(
+				`Migrated ${result.rewrites} embed(s).` +
+					(result.downloads > 0 ? ` Downloaded ${result.downloads}.` : "") +
+					(result.errors > 0 ? ` ${result.errors} error(s).` : "")
+			);
+		} catch (e) {
+			notice.hide();
+			console.error("[XPostEmbed] Migration failed:", e);
+			new Notice("Media migration failed. See console.");
+		}
+	}
+
+	async migrateMediaAllTweets(): Promise<void> {
+		const tweetsFolder = normalizePath(this.settings.tweetsFolder);
+		const folderPrefix = tweetsFolder.endsWith("/") ? tweetsFolder : tweetsFolder + "/";
+		const files = this.app.vault
+			.getMarkdownFiles()
+			.filter((f) => f.path === tweetsFolder || f.path.startsWith(folderPrefix));
+
+		if (files.length === 0) {
+			new Notice(`No notes found under "${tweetsFolder}".`);
+			return;
+		}
+
+		const downloadNote = this.settings.downloadMediaLocally
+			? " Remote media will be downloaded into the vault."
+			: "";
+		const body =
+			`Found ${files.length} note(s) under "${tweetsFolder}". This will rewrite tweet media embeds to match your current image size and width settings.${downloadNote}\n\n` +
+			"Re-running is safe — already-migrated embeds will not change. Failed downloads will fall back to remote URLs.";
+
+		const proceed = await new Promise<boolean>((resolve) => {
+			new ConfirmModal(
+				this.app,
+				"Migrate tweet media",
+				body,
+				"Migrate",
+				resolve
+			).open();
+		});
+		if (!proceed) return;
+
+		const progress = new Notice(`Migrating media… 0/${files.length}`, 0);
+		let totalRewrites = 0;
+		let totalDownloads = 0;
+		let totalErrors = 0;
+		let filesChanged = 0;
+
+		for (let i = 0; i < files.length; i++) {
+			const file = files[i];
+			progress.setMessage(`Migrating media… ${i + 1}/${files.length}`);
+			try {
+				const current = await this.app.vault.read(file);
+				const result = await this.migrateMediaInContent(current);
+				if (result.content !== current) {
+					await this.app.vault.modify(file, result.content);
+					filesChanged++;
+				}
+				totalRewrites += result.rewrites;
+				totalDownloads += result.downloads;
+				totalErrors += result.errors;
+			} catch (e) {
+				console.error(`[XPostEmbed] Migration failed for ${file.path}:`, e);
+				totalErrors++;
+			}
+		}
+
+		progress.hide();
+		new Notice(
+			`Migrated ${totalRewrites} embed(s) across ${filesChanged} file(s).` +
+				(totalDownloads > 0 ? ` Downloaded ${totalDownloads}.` : "") +
+				(totalErrors > 0 ? ` ${totalErrors} error(s) — see console.` : "")
+		);
 	}
 
 	// --- Save as note (existing feature) ---
