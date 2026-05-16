@@ -480,16 +480,45 @@ export default class XPostEmbedPlugin extends Plugin {
 		return lang ? `/${encodeURIComponent(lang)}` : "";
 	}
 
-	private async fetchThreadV2(tweetId: string, tweetUrl: string): Promise<TweetData | null> {
-		const apiUrl = `https://api.fxtwitter.com/2/thread/${tweetId}${this.translationSuffix()}`;
-		const response = await this.requestWithRetries(
-			() => requestUrl({ url: apiUrl, method: "GET" }),
-			2,
-			1500
-		);
+	/**
+	 * Fetch a FxTwitter JSON endpoint, retrying without the language suffix if the
+	 * translated variant fails. FxTwitter returns 404 when source language == target
+	 * (no translation needed), and its `/i/status/` endpoint also truncates Premium
+	 * long-form tweets — only the no-lang `/2/thread/` path returns full text.
+	 */
+	private async fxFetchJson<T extends { code?: number }>(
+		buildUrl: (langSuffix: string) => string,
+		retries: number,
+		delay: number,
+	): Promise<T | null> {
+		const lang = this.translationSuffix();
+		const attempt = async (suffix: string): Promise<T | null> => {
+			try {
+				const response = await this.requestWithRetries(
+					() => requestUrl({ url: buildUrl(suffix), method: "GET" }),
+					retries,
+					delay,
+				);
+				const json = response.json as T;
+				return json && json.code === 200 ? json : null;
+			} catch {
+				return null;
+			}
+		};
 
-		const json = response.json as FxV2ThreadResponse;
-		if (json.code !== 200 || !json.status) return null;
+		const first = await attempt(lang);
+		if (first) return first;
+		if (!lang) return null;
+		return attempt("");
+	}
+
+	private async fetchThreadV2(tweetId: string, tweetUrl: string): Promise<TweetData | null> {
+		const json = await this.fxFetchJson<FxV2ThreadResponse>(
+			(lang) => `https://api.fxtwitter.com/2/thread/${tweetId}${lang}`,
+			2,
+			1500,
+		);
+		if (!json || json.code !== 200 || !json.status) return null;
 
 		const focalTweet = json.status;
 		const author = focalTweet.author ?? json.author ?? {};
@@ -526,17 +555,13 @@ export default class XPostEmbedPlugin extends Plugin {
 	}
 
 	private async fetchSingleAndWalk(tweetId: string, tweetUrl: string): Promise<TweetData> {
-		const apiUrl = `https://api.fxtwitter.com/i/status/${tweetId}${this.translationSuffix()}`;
-
-		const response = await this.requestWithRetries(
-			() => requestUrl({ url: apiUrl, method: "GET" }),
+		const json = await this.fxFetchJson<FxSingleResponse>(
+			(lang) => `https://api.fxtwitter.com/i/status/${tweetId}${lang}`,
 			3,
-			2000
+			2000,
 		);
-
-		const json = response.json as FxSingleResponse;
-		if (json.code !== 200 || !json.tweet) {
-			throw new Error(json.message || "FxTwitter API error");
+		if (!json || json.code !== 200 || !json.tweet) {
+			throw new Error(json?.message || "FxTwitter API error");
 		}
 
 		const tweet: FxTweet = json.tweet;
@@ -648,34 +673,21 @@ export default class XPostEmbedPlugin extends Plugin {
 
 			const parentId = parent.parentId;
 
-			try {
-				const apiUrl = `https://api.fxtwitter.com/i/status/${parentId}${this.translationSuffix()}`;
-				const response = await this.requestWithRetries(
-					() => requestUrl({ url: apiUrl, method: "GET" }),
-					2,
-					1000
-				);
-
-				if (!response || response.status !== 200) {
-					console.warn(`[XPostEmbed] Failed to fetch parent tweet ${parentId}: HTTP ${response?.status}`);
-					break;
-				}
-
-				const json = response.json as FxSingleResponse;
-				if (json.code !== 200 || !json.tweet) {
-					console.warn(`[XPostEmbed] Unexpected API response for tweet ${parentId}:`, json);
-					break;
-				}
-
-				tweets.unshift(json.tweet); // Prepend (oldest first)
-				current = json.tweet;
-
-				// Delay between requests to avoid rate-limiting by FxTwitter
-				await new Promise(resolve => setTimeout(resolve, 500));
-			} catch (error) {
-				console.error(`[XPostEmbed] Error fetching parent tweet ${parentId}:`, error);
+			const json = await this.fxFetchJson<FxSingleResponse>(
+				(lang) => `https://api.fxtwitter.com/i/status/${parentId}${lang}`,
+				2,
+				1000,
+			);
+			if (!json || json.code !== 200 || !json.tweet) {
+				console.warn(`[XPostEmbed] Failed to fetch parent tweet ${parentId}`);
 				break;
 			}
+
+			tweets.unshift(json.tweet); // Prepend (oldest first)
+			current = json.tweet;
+
+			// Delay between requests to avoid rate-limiting by FxTwitter
+			await new Promise((resolve) => setTimeout(resolve, 500));
 		}
 
 		return tweets;
