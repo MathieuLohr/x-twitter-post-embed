@@ -9,6 +9,7 @@ import {
 	Setting,
 	TFile,
 	TFolder,
+	Vault,
 	normalizePath,
 	requestUrl,
 } from "obsidian";
@@ -1171,10 +1172,22 @@ export default class XPostEmbedPlugin extends Plugin {
 
 	async migrateMediaAllTweets(): Promise<void> {
 		const tweetsFolder = normalizePath(this.settings.tweetsFolder);
-		const folderPrefix = tweetsFolder.endsWith("/") ? tweetsFolder : tweetsFolder + "/";
-		const files = this.app.vault
-			.getMarkdownFiles()
-			.filter((f) => f.path === tweetsFolder || f.path.startsWith(folderPrefix));
+		const folderEntry = this.app.vault.getAbstractFileByPath(tweetsFolder);
+		if (!folderEntry) {
+			new Notice(`No notes found under "${tweetsFolder}".`);
+			return;
+		}
+		if (!(folderEntry instanceof TFolder)) {
+			new Notice(`"${tweetsFolder}" is not a folder.`);
+			return;
+		}
+
+		const files: TFile[] = [];
+		Vault.recurseChildren(folderEntry, (child) => {
+			if (child instanceof TFile && child.extension === "md") {
+				files.push(child);
+			}
+		});
 
 		if (files.length === 0) {
 			new Notice(`No notes found under "${tweetsFolder}".`);

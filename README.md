@@ -62,6 +62,15 @@ This plugin makes requests to external services to fetch tweet data. No user dat
 | [FxTwitter API](https://github.com/FixTweet/FxTwitter) | `api.fxtwitter.com` | Primary source for tweet text, threads, and metadata |
 | Twitter oEmbed | `publish.twitter.com` | Fallback if FxTwitter is unavailable |
 
+## Privacy & Permissions
+
+This plugin only accesses what's needed for its features:
+
+- **Vault files** — only markdown notes under your configured **Tweets folder** are read or modified, and only when you run the "Migrate tweet media" command.
+- **Clipboard read** — only when you click the "Paste from clipboard" button in the tweet URL modal. Falls back to manual paste if blocked.
+- **Clipboard write** — only when the "Copy path to clipboard" setting is enabled, and only after you save a tweet as a note (writes a wiki-link, nothing else).
+- **Network** — see "Network Usage" above. No telemetry, no analytics.
+
 ## Credits
 
 Inspired by [x-post-saver](https://github.com/tanaka-mambinge/x-post-saver) by [tanaka-mambinge](https://github.com/tanaka-mambinge), which provided the initial concept and project scaffolding for saving X posts in Obsidian.
