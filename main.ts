@@ -72,6 +72,8 @@ function extractTweetId(url: string): string | null {
 }
 
 interface FxTweet {
+	id?: string;
+	lang?: string;
 	text?: string;
 	url?: string;
 	created_at?: string;
@@ -526,6 +528,12 @@ export default class XPostEmbedPlugin extends Plugin {
 		const date = this.formatDateFromFx(focalTweet.created_at ?? "");
 
 		const tweets = (json.thread && json.thread.length > 0) ? json.thread : [focalTweet];
+
+		// /2/thread/{id}/{lang} always 404s, so fxFetchJson fell back to no-lang and lost any
+		// translation. Patch each tweet (and its quote) via /i/status/{id}/{lang} so configured
+		// translations are still applied.
+		await this.enrichThreadWithTranslations(tweets);
+
 		const thread_texts = await Promise.all(tweets.map((t: FxTweet) => this.compileTweetNode(t)));
 
 		return {
@@ -553,6 +561,53 @@ export default class XPostEmbedPlugin extends Plugin {
 				followers: author.followers || 0,
 			},
 		};
+	}
+
+	/**
+	 * For each tweet in a thread (and its quote), if its source language differs from the
+	 * configured translation target and no translation is already attached, fetch the
+	 * translation via /i/status/{id}/{lang} and inject it. No-op when no target lang is set.
+	 */
+	private async enrichThreadWithTranslations(tweets: FxTweet[]): Promise<void> {
+		const target = this.settings.translateToLanguage.trim().toLowerCase();
+		if (!target) return;
+		await Promise.all(tweets.map((t) => this.attachTranslation(t, target)));
+	}
+
+	private async attachTranslation(tweet: FxTweet, target: string): Promise<void> {
+		const tasks: Promise<void>[] = [];
+
+		const needsTranslation = (t: FxTweet): boolean =>
+			!t.translation &&
+			!!t.id &&
+			(!t.lang || t.lang.toLowerCase() !== target);
+
+		if (needsTranslation(tweet)) {
+			tasks.push(this.fetchAndAttachTranslation(tweet, target));
+		}
+		if (tweet.quote && needsTranslation(tweet.quote)) {
+			tasks.push(this.fetchAndAttachTranslation(tweet.quote, target));
+		}
+
+		if (tasks.length) await Promise.all(tasks);
+	}
+
+	private async fetchAndAttachTranslation(tweet: FxTweet, target: string): Promise<void> {
+		if (!tweet.id) return;
+		const url = `https://api.fxtwitter.com/i/status/${tweet.id}/${encodeURIComponent(target)}`;
+		try {
+			const response = await this.requestWithRetries(
+				() => requestUrl({ url, method: "GET" }),
+				2,
+				1000,
+			);
+			const json = response.json as FxSingleResponse;
+			if (json?.code === 200 && json.tweet?.translation) {
+				tweet.translation = json.tweet.translation;
+			}
+		} catch {
+			// Silent: translation is a best-effort enhancement.
+		}
 	}
 
 	private async fetchSingleAndWalk(tweetId: string, tweetUrl: string): Promise<TweetData> {
