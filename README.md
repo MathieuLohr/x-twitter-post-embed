@@ -50,6 +50,7 @@ An Obsidian plugin that automatically embeds X (formerly Twitter) post text when
 | Include media | Embed images from tweets | On |
 | Include metrics | Show likes, reposts, etc. | Off |
 | Include community notes | Show community notes | On |
+| Include quoted tweet's thread | When a quoted post is part of a thread, embed the whole thread inside the quote | Off |
 | Include author bio | Show author description/followers | Off |
 | Translate tweets to language | ISO code (e.g. `en`) for FxTwitter translation; blank disables | `en` |
 
