@@ -33,6 +33,7 @@ interface XPostEmbedSettings {
 	downloadMediaLocally: boolean;
 	mediaAttachmentsFolder: string;
 	includeCommunityNote: boolean;
+	includeQuotedThread: boolean;
 	includeMetrics: boolean;
 	includeAuthorBio: boolean;
 	metadataAtTop: boolean;
@@ -57,6 +58,7 @@ const DEFAULT_SETTINGS: XPostEmbedSettings = {
 	downloadMediaLocally: false,
 	mediaAttachmentsFolder: "Tweets/Media",
 	includeCommunityNote: true,
+	includeQuotedThread: false,
 	includeMetrics: false,
 	includeAuthorBio: false,
 	metadataAtTop: false,
@@ -766,7 +768,22 @@ export default class XPostEmbedPlugin extends Plugin {
 		return (tweet.media.all ?? []).map((m) => m.url);
 	}
 
-	private async compileTweetNode(tweet: FxTweet): Promise<string> {
+	/**
+	 * Fetch the full thread a quoted tweet belongs to (posts above and below it).
+	 * Returns null when the tweet is not part of a thread or the fetch fails.
+	 */
+	private async fetchQuotedThread(quoteId: string): Promise<FxTweet[] | null> {
+		const json = await this.fxFetchJson<FxV2ThreadResponse>(
+			(lang) => `https://api.fxtwitter.com/2/thread/${quoteId}${lang}`,
+			2,
+			1500,
+		);
+		if (!json?.thread || json.thread.length < 2) return null;
+		await this.enrichThreadWithTranslations(json.thread);
+		return json.thread;
+	}
+
+	private async compileTweetNode(tweet: FxTweet, expandQuotedThread = true): Promise<string> {
 		let content = this.tweetText(tweet);
 
 		// Attach media directly below the text it belongs to
@@ -784,8 +801,21 @@ export default class XPostEmbedPlugin extends Plugin {
 				tweet.quote.author?.screen_name ||
 				tweet.quote.author?.name ||
 				"Unknown";
-			const quoteContent = await this.compileTweetNode(tweet.quote);
-			content += `\n\n> [!quote] Quoting @${quoteAuthor}\n> ${quoteContent.replace(/\n/g, "\n> ")}`;
+			// Optionally expand the quoted tweet into its whole thread (one level deep only)
+			const thread =
+				expandQuotedThread && this.settings.includeQuotedThread && tweet.quote.id
+					? await this.fetchQuotedThread(tweet.quote.id)
+					: null;
+			let header = `Quoting @${quoteAuthor}`;
+			let quoteContent: string;
+			if (thread) {
+				header += ` (thread, ${thread.length} posts)`;
+				const parts = await Promise.all(thread.map((t) => this.compileTweetNode(t, false)));
+				quoteContent = parts.join("\n\n");
+			} else {
+				quoteContent = await this.compileTweetNode(tweet.quote, false);
+			}
+			content += `\n\n> [!quote] ${header}\n> ${quoteContent.replace(/\n/g, "\n> ")}`;
 		}
 
 		// Attach community note to the specific post it belongs to
@@ -1826,6 +1856,18 @@ class XPostEmbedSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.includeCommunityNote)
 					.onChange(async (value) => {
 						this.plugin.settings.includeCommunityNote = value;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Include quoted tweet's thread")
+			.setDesc("When a tweet quotes a post that is part of a thread, embed the whole thread inside the quote instead of only the quoted post.")
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.includeQuotedThread)
+					.onChange(async (value) => {
+						this.plugin.settings.includeQuotedThread = value;
 						await this.plugin.saveSettings();
 					})
 			);
