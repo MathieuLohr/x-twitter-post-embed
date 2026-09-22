@@ -39,6 +39,7 @@ interface XPostEmbedSettings {
 	metadataAtTop: boolean;
 	separatorPosition: "none" | "above" | "below" | "both";
 	translateToLanguage: string;
+	keepOriginalLanguages: string;
 }
 
 const DEFAULT_SETTINGS: XPostEmbedSettings = {
@@ -64,6 +65,7 @@ const DEFAULT_SETTINGS: XPostEmbedSettings = {
 	metadataAtTop: false,
 	separatorPosition: "none",
 	translateToLanguage: "en",
+	keepOriginalLanguages: "",
 };
 
 // --- Helpers ---
@@ -73,9 +75,22 @@ function extractTweetId(url: string): string | null {
 	return match ? match[1] : null;
 }
 
+/** Split a user-entered list like "de, fr" into lowercase language codes. */
+function parseLanguageList(value: string): string[] {
+	return value
+		.split(/[\s,;]+/)
+		.map((code) => code.trim().toLowerCase())
+		.filter(Boolean);
+}
+
+/** Reduce a language tag to its primary subtag, so "pt-BR" and "pt" compare equal. */
+function primaryLanguage(code: string): string {
+	return code.toLowerCase().split(/[-_]/)[0];
+}
+
 interface FxTweet {
 	id?: string;
-	lang?: string;
+	lang?: string | null;
 	text?: string;
 	url?: string;
 	created_at?: string;
@@ -485,6 +500,15 @@ export default class XPostEmbedPlugin extends Plugin {
 		return lang ? `/${encodeURIComponent(lang)}` : "";
 	}
 
+	/** True when tweets in this language should stay untranslated (user reads it). */
+	private isKeptOriginal(lang: string | null | undefined): boolean {
+		if (!lang) return false;
+		const code = primaryLanguage(lang);
+		return parseLanguageList(this.settings.keepOriginalLanguages).some(
+			(kept) => primaryLanguage(kept) === code,
+		);
+	}
+
 	/**
 	 * Fetch a FxTwitter JSON endpoint, retrying without the language suffix if the
 	 * translated variant fails. FxTwitter returns 404 when source language == target
@@ -582,6 +606,7 @@ export default class XPostEmbedPlugin extends Plugin {
 		const needsTranslation = (t: FxTweet): boolean =>
 			!t.translation &&
 			!!t.id &&
+			!this.isKeptOriginal(t.lang) &&
 			(!t.lang || t.lang.toLowerCase() !== target);
 
 		if (needsTranslation(tweet)) {
@@ -752,7 +777,11 @@ export default class XPostEmbedPlugin extends Plugin {
 	}
 
 	private tweetText(tweet: FxTweet): string {
-		return tweet.translation?.text || tweet.text || "";
+		const translated = tweet.translation?.text;
+		// /i/status/{id}/{lang} attaches a translation up front, so drop it here for kept languages
+		const keepOriginal =
+			this.isKeptOriginal(tweet.lang) || this.isKeptOriginal(tweet.translation?.source_lang);
+		return (!keepOriginal && translated) || tweet.text || "";
 	}
 
 	private selectMediaUrls(tweet: FxTweet): string[] {
@@ -1765,6 +1794,20 @@ class XPostEmbedSettingTab extends PluginSettingTab {
 				text.setPlaceholder("en").setValue(this.plugin.settings.translateToLanguage);
 				const debouncedSave = this.plugin.debounce(async (value: string) => {
 					this.plugin.settings.translateToLanguage = value.trim().toLowerCase();
+					await this.plugin.saveSettings();
+				}, 500);
+				text.onChange(debouncedSave);
+			});
+
+		new Setting(containerEl)
+			.setName("Keep original for these languages")
+			.setDesc(
+				"Language codes you read, separated by commas (for example de, fr). Tweets in these languages are embedded untranslated. Leave blank to translate every language other than the target above."
+			)
+			.addText((text) => {
+				text.setPlaceholder("Example: de, fr").setValue(this.plugin.settings.keepOriginalLanguages);
+				const debouncedSave = this.plugin.debounce(async (value: string) => {
+					this.plugin.settings.keepOriginalLanguages = value.trim().toLowerCase();
 					await this.plugin.saveSettings();
 				}, 500);
 				text.onChange(debouncedSave);
