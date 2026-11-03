@@ -42,6 +42,7 @@ An Obsidian plugin that automatically embeds X (formerly Twitter) post text when
 | Setting | Description | Default |
 |---------|-------------|---------|
 | Tweets folder | Where saved tweet notes are stored | `Tweets` |
+| Per-author subfolders | Save tweet notes into `<Tweets folder>/<handle>/` | Off |
 | Author pages | Create per-author aggregation pages | Off |
 | Paste format | Blockquote, callout, or plain | Blockquote |
 | Auto-embed on paste | Automatically replace pasted URLs | On |

@@ -18,6 +18,7 @@ import {
 
 interface XPostEmbedSettings {
 	tweetsFolder: string;
+	authorSubfolders: boolean;
 	enableAuthorPages: boolean;
 	authorPagesFolder: string;
 	authorPageOrder: "newest" | "oldest";
@@ -44,6 +45,7 @@ interface XPostEmbedSettings {
 
 const DEFAULT_SETTINGS: XPostEmbedSettings = {
 	tweetsFolder: "Tweets",
+	authorSubfolders: false,
 	enableAuthorPages: true,
 	authorPagesFolder: "Tweets/Authors",
 	authorPageOrder: "newest",
@@ -1407,7 +1409,12 @@ export default class XPostEmbedPlugin extends Plugin {
 	}
 
 	async saveTweetAsNote(data: TweetData): Promise<string> {
-		const tweetsFolder = normalizePath(this.settings.tweetsFolder);
+		const screenName = data.author_screen_name || this.sanitizeFileName(data.author_name);
+		const tweetsFolder = normalizePath(
+			this.settings.authorSubfolders
+				? `${this.settings.tweetsFolder}/${screenName}`
+				: this.settings.tweetsFolder
+		);
 
 		// Ensure folder exists
 		const folder = this.app.vault.getAbstractFileByPath(tweetsFolder);
@@ -1622,6 +1629,18 @@ class XPostEmbedSettingTab extends PluginSettingTab {
 				}, 500);
 				text.onChange(debouncedSave);
 			});
+
+		new Setting(containerEl)
+			.setName("Per-author subfolders")
+			.setDesc("Save each tweet into a subfolder of the tweets folder named after the author's handle (e.g. Tweets/jack/).")
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.authorSubfolders)
+					.onChange(async (value) => {
+						this.plugin.settings.authorSubfolders = value;
+						await this.plugin.saveSettings();
+					})
+			);
 
 		new Setting(containerEl)
 			.setName("Enable author pages")
