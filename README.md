@@ -8,7 +8,7 @@ An Obsidian plugin that automatically embeds X (formerly Twitter) post text when
 - **Full thread support** — captures entire tweet threads, not just the first post
 - **Multiple formats** — blockquote, callout, or plain text
 - **Save as note** — save tweets as individual markdown files
-- **Author pages** — automatically creates per-author aggregation pages with transclusion
+- **Author pages** — automatically creates per-author aggregation pages with transclusion; the author name in each pasted embed and saved note links to that page
 - **Rich metadata** — optionally includes date, media, engagement metrics, community notes, and author bio
 - **Translation** — fetch tweets in a chosen language via FxTwitter (defaults to English; blank to disable), with a list of languages to keep untranslated (e.g. `de, fr`)
 - **Quote tweet support** — nested formatting for quoted tweets
@@ -42,6 +42,7 @@ An Obsidian plugin that automatically embeds X (formerly Twitter) post text when
 | Setting | Description | Default |
 |---------|-------------|---------|
 | Tweets folder | Where saved tweet notes are stored | `Tweets` |
+| Per-author subfolders | Save tweet notes into `<Tweets folder>/<handle>/` | Off |
 | Author pages | Create per-author aggregation pages | Off |
 | Paste format | Blockquote, callout, or plain | Blockquote |
 | Auto-embed on paste | Automatically replace pasted URLs | On |

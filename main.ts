@@ -18,6 +18,7 @@ import {
 
 interface XPostEmbedSettings {
 	tweetsFolder: string;
+	authorSubfolders: boolean;
 	enableAuthorPages: boolean;
 	authorPagesFolder: string;
 	authorPageOrder: "newest" | "oldest";
@@ -44,6 +45,7 @@ interface XPostEmbedSettings {
 
 const DEFAULT_SETTINGS: XPostEmbedSettings = {
 	tweetsFolder: "Tweets",
+	authorSubfolders: false,
 	enableAuthorPages: true,
 	authorPagesFolder: "Tweets/Authors",
 	authorPageOrder: "newest",
@@ -1044,11 +1046,21 @@ export default class XPostEmbedPlugin extends Plugin {
 
 	// --- Format for inline embed ---
 
+	/** Author label, wiki-linked to the author page when author pages are enabled. */
+	authorLink(data: TweetData, label: string): string {
+		if (!this.settings.enableAuthorPages) return label;
+		const screenName = data.author_screen_name || this.sanitizeFileName(data.author_name);
+		const target = normalizePath(`${this.settings.authorPagesFolder}/${screenName}`);
+		// "[", "]" and "|" would break the wiki-link alias
+		return `[[${target}|${label.replace(/[[\]|]/g, "")}]]`;
+	}
+
 	formatTweetEmbed(
 		data: TweetData,
 		format: "blockquote" | "callout" | "plain"
 	): string {
 		const { url, author_name, thread_texts, tweet_date, media_urls, community_note, metrics } = data;
+		const author = this.authorLink(data, `@${author_name}`);
 
 		// Join thread texts with a blank line between them, then format quotes
 		let combinedText = thread_texts.join("\n\n");
@@ -1063,7 +1075,7 @@ export default class XPostEmbedPlugin extends Plugin {
 			});
 		}
 
-		let footer = `\u2014 @${author_name}${this.settings.includeTweetDate && tweet_date ? ` \u2014 ${tweet_date}` : ""} ([Source](${url}))`;
+		let footer = `\u2014 ${author}${this.settings.includeTweetDate && tweet_date ? ` \u2014 ${tweet_date}` : ""} ([Source](${url}))`;
 
 		if (this.settings.includeMetrics && metrics) {
 			footer += `\n💬 ${metrics.replies} | 🔁 ${metrics.reposts} | ❤️ ${metrics.likes} | 👁️ ${metrics.views} | 🔖 ${metrics.bookmarks}`;
@@ -1084,9 +1096,9 @@ export default class XPostEmbedPlugin extends Plugin {
 				let calloutLines = lines;
 				const footerLines = footer.replace(/\n/g, "\n> ");
 				if (this.settings.metadataAtTop) {
-					result = `> [!quote] @${author_name} \u2014 ${displayDate}\n> ${footerLines}\n>\n> ${calloutLines}`;
+					result = `> [!quote] ${author} \u2014 ${displayDate}\n> ${footerLines}\n>\n> ${calloutLines}`;
 				} else {
-					result = `> [!quote] @${author_name} \u2014 ${displayDate}\n> ${calloutLines}\n>\n> ${footerLines}`;
+					result = `> [!quote] ${author} \u2014 ${displayDate}\n> ${calloutLines}\n>\n> ${footerLines}`;
 				}
 				break;
 			}
@@ -1407,7 +1419,12 @@ export default class XPostEmbedPlugin extends Plugin {
 	}
 
 	async saveTweetAsNote(data: TweetData): Promise<string> {
-		const tweetsFolder = normalizePath(this.settings.tweetsFolder);
+		const screenName = data.author_screen_name || this.sanitizeFileName(data.author_name);
+		const tweetsFolder = normalizePath(
+			this.settings.authorSubfolders
+				? `${this.settings.tweetsFolder}/${screenName}`
+				: this.settings.tweetsFolder
+		);
 
 		// Ensure folder exists
 		const folder = this.app.vault.getAbstractFileByPath(tweetsFolder);
@@ -1551,7 +1568,7 @@ export default class XPostEmbedPlugin extends Plugin {
 		}
 
 		return [
-			`# Tweet by ${data.author_name}`,
+			`# Tweet by ${this.authorLink(data, data.author_name)}`,
 			"",
 			...(this.settings.metadataAtTop ? [footer, ""] : []),
 			`> ${combinedText.replace(/\n/g, "\n> ")}`,
@@ -1622,6 +1639,18 @@ class XPostEmbedSettingTab extends PluginSettingTab {
 				}, 500);
 				text.onChange(debouncedSave);
 			});
+
+		new Setting(containerEl)
+			.setName("Per-author subfolders")
+			.setDesc("Save each tweet into a subfolder of the tweets folder named after the author's handle (e.g. Tweets/jack/).")
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.authorSubfolders)
+					.onChange(async (value) => {
+						this.plugin.settings.authorSubfolders = value;
+						await this.plugin.saveSettings();
+					})
+			);
 
 		new Setting(containerEl)
 			.setName("Enable author pages")
